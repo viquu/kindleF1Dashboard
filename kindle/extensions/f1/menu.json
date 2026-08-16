@@ -1,0 +1,29 @@
+{
+    "items": [
+        {
+            "name": "F1 Dashboard",
+            "items": [
+                {
+                    "name": "Refresh Now",
+                    "action": "sh /mnt/us/extensions/f1/bin/refresh.sh",
+                    "exitmenu": false
+                },
+                {
+                    "name": "Start Service (auto-refresh)",
+                    "action": "sh /mnt/us/extensions/f1/bin/start.sh",
+                    "exitmenu": false
+                },
+                {
+                    "name": "Stop Service",
+                    "action": "sh /mnt/us/extensions/f1/bin/stop.sh",
+                    "exitmenu": false
+                },
+                {
+                    "name": "Enable Wifi",
+                    "action": "lipc-set-prop com.lab126.cmd wirelessEnable 1",
+                    "exitmenu": false
+                }
+            ]
+        }
+    ]
+}

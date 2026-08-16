@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<extension>
+  <information>
+    <name>F1 Dashboard</name>
+    <version>0.1</version>
+    <author>viquu</author>
+    <id>F1-Dashboard</id>
+  </information>
+  <menus>
+    <menu type="json" dynamic="true">menu.json</menu>
+  </menus>
+</extension>
