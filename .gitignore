@@ -2,4 +2,5 @@
 .claude/
 __pycache__/
 *.pyc
+.venv/
 tools/svg/

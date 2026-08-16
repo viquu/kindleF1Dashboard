@@ -44,6 +44,7 @@ TOP_DRIVERS = 8
 TOP_CONSTRUCTORS = 8
 TOP_RESULTS = 5
 TRACKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracks.json")
+CAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "car.json")
 
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
@@ -157,6 +158,22 @@ def get_track(circuit_id):
         except Exception:
             _tracks = {}
     return _tracks.get(circuit_id)
+
+
+_car = None
+
+
+def get_car():
+    """赛车剪影闭合环数组(0-1000 网格)或 None;car.json 缺失/损坏时静默返回 None。"""
+    global _car
+    if _car is None:
+        try:
+            with open(CAR_FILE) as f:
+                rings = json.load(f).get("rings")
+            _car = rings if isinstance(rings, list) else None
+        except Exception:
+            _car = None
+    return _car
 
 
 def get_dashboard_data():
@@ -290,7 +307,7 @@ def show_render(data):
 
 # ---------------- Pillow 屏保图片(png) ----------------
 # 单页紧凑布局(600x800 设计区,自动加画布偏移 DX/DY):
-#   0-56    标题栏
+#   0-56    标题栏(左侧白色赛车剪影,居中 DASHBOARD,右侧 "F1" 字标 + 斜纹)
 #   64-194  NEXT RACE(赛道名/轮次日期/倒计时,水平居中于 x=240),右侧赛道轮廓图
 #   204+     SEASON PROGRESS(进度条按文本 ink 底动态定位)
 #   246-510 两栏榜单(车手/车队各 8 行)
@@ -314,12 +331,39 @@ def draw_track(d, box, pts):
     d.line(xy, fill=0, width=2, joint="curve")
 
 
+def draw_car(d, box, rings, fill=0):
+    """赛车实心剪影:rings 为闭合环数组(0-1000 网格),box 为设计区坐标。
+
+    按 rings 实际 bbox 等比装入 box(车高约 267/1000,不能按满格 1000 居中)。
+    逐环 polygon 填充而不是合并成一个多边形——Pillow 的填充规则在
+    嵌套子路径下会把轮子与车身重叠区挖成孔,分开填同色天然合并。
+    """
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    xs = [p[0] for ring in rings for p in ring]
+    ys = [p[1] for ring in rings for p in ring]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    cw, ch = max(maxx - minx, 1), max(maxy - miny, 1)
+    s = min(w / float(cw), h / float(ch))
+    ox = DX + x0 + (w - cw * s) / 2 - minx * s
+    oy = DY + y0 + (h - ch * s) / 2 - miny * s
+    for ring in rings:
+        d.polygon([(ox + p[0] * s, oy + p[1] * s) for p in ring], fill=fill)
+
+
 def png_render(data, out=SS_OUT):
     img = Image.new("L", SS_SIZE, 255)
     d = ImageDraw.Draw(img)
 
     def font(bold, size):
-        return ImageFont.truetype(FONT_BOLD if bold else FONT_MED, size)
+        # Kindle 用 Futura;开发机无此字体时退回 Helvetica/macOS 内置
+        for path in (FONT_BOLD if bold else FONT_MED,
+                     "/System/Library/Fonts/Helvetica.ttc"):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
 
     def text(x, y, s, f, fill=0, anchor="la"):
         d.text((DX + x, DY + y), s, font=f, fill=fill, anchor=anchor)
@@ -328,9 +372,15 @@ def png_render(data, out=SS_OUT):
         """水平居中于 x(la 锚 + 动态测宽),任何字体下都不会右溢出。"""
         return x - d.textlength(s, font=f) / 2
 
-    # 标题栏
+    # 标题栏:左侧白色赛车剪影 + 居中 DASHBOARD + 右侧 "F1" 字标/斜纹
     d.rectangle([DX, DY, DX + 600 - 1, DY + 56], fill=0)
-    text(300, 28, "F1  DASHBOARD", font(True, 34), fill=255, anchor="mm")
+    car = get_car()
+    if car:
+        draw_car(d, (8, 10, 158, 46), car, fill=255)
+    text(300, 28, "DASHBOARD", font(True, 34), fill=255, anchor="mm")
+    text(575, 28, "F1", font(True, 30), fill=255, anchor="rm")
+    for x in (462, 479, 496):
+        d.line([DX + x, DY + 44, DX + x + 16, DY + 10], fill=255, width=2)
 
     if data["err"] is not None:
         text(300, 380, "FETCH FAILED", font(True, 32), anchor="mm")
@@ -469,14 +519,52 @@ def service_mode():
 
 # ---------------- 入口 ----------------
 
+def mock_data(err=False):
+    """离线假数据:png --mock / --mock-err 用,渲染不联网(开发机验证布局)。"""
+    next_race = {"raceName": "Dutch Grand Prix", "round": "12",
+                 "date": "2026-08-23",
+                 "Circuit": {"circuitId": "zandvoort"}}
+    last_race = {"raceName": "Hungarian Grand Prix", "round": "11"}
+    return {
+        "next_race": None if err else next_race,
+        "last_race": None if err else last_race,
+        "standings": [("1", "Kimi Antonelli", "219"), ("2", "Lewis Hamilton", "169"),
+                      ("3", "Max Verstappen", "163"), ("4", "Lando Norris", "152"),
+                      ("5", "Charles Leclerc", "131"), ("6", "George Russell", "122"),
+                      ("7", "Oscar Piastri", "118"), ("8", "Carlos Sainz", "104")],
+        "constructors": [("1", "Mercedes", "379"), ("2", "Ferrari", "307"),
+                         ("3", "McLaren", "281"), ("4", "Red Bull", "242"),
+                         ("5", "Aston Martin", "117"), ("6", "Williams", "48"),
+                         ("7", "Alpine", "42"), ("8", "Haas", "21")],
+        "last_results": [("1", "Lando Norris", "1:39:56.180"),
+                         ("2", "Max Verstappen", "+15.080"),
+                         ("3", "Oscar Piastri", "+18.362"),
+                         ("4", "Charles Leclerc", "+22.054"),
+                         ("5", "George Russell", "Power Unit")],
+        "countdown": None if err else "in 7d 06h",
+        "progress": None if err else (11, 23),
+        "upd": "12:34",
+        "err": Exception("network unreachable") if err else None,
+    }
+
+
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "show"
+    argv = sys.argv[1:]
+    mode = next((a for a in argv if not a.startswith("--")), "show")
+    out = SS_OUT
+    if "--out" in argv:
+        out = argv[argv.index("--out") + 1]
     if mode == "service":
         service_mode()
         return 0
-    data = get_dashboard_data()
+    if "--mock" in argv:
+        data = mock_data(err=False)
+    elif "--mock-err" in argv:
+        data = mock_data(err=True)
+    else:
+        data = get_dashboard_data()
     if mode == "png":
-        png_render(data)
+        png_render(data, out=out)
     else:
         show_render(data)
     return 0 if data["err"] is None else 1
