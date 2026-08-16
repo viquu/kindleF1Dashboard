@@ -290,11 +290,15 @@ def show_render(data):
 
 # ---------------- Pillow 屏保图片(png) ----------------
 # 单页紧凑布局(600x800 设计区,自动加画布偏移 DX/DY):
-#   0-56   标题栏
-#   64-196 NEXT RACE(赛道名/轮次日期/倒计时/赛季进度条),右侧赛道轮廓图
-#   204-476 两栏榜单(车手/车队各 8 行,行内积分条)
-#   496-682 上场比赛 Top 5
-#   760    页脚
+#   0-56    标题栏
+#   64-194  NEXT RACE(赛道名/轮次日期/倒计时,水平居中于 x=240),右侧赛道轮廓图
+#   204+     SEASON PROGRESS(进度条按文本 ink 底动态定位)
+#   246-510 两栏榜单(车手/车队各 8 行)
+#   522-704 上场比赛 Top 5
+#   760     页脚
+# 间距约定:全部用 la 顶部锚 + 行高按 1.1em 保守预留(Kindle Futura 行高
+# 大于开发机 Helvetica),进度条/居中文本用 textbbox/textlength 动态定位,
+# 任何字体度量下都不重叠、不撞右侧轨道图框。
 
 def draw_track(d, box, pts):
     """赛道轮廓:pts 为 0-1000 网格坐标,box 为设计区坐标(自动加画布偏移)。"""
@@ -320,6 +324,10 @@ def png_render(data, out=SS_OUT):
     def text(x, y, s, f, fill=0, anchor="la"):
         d.text((DX + x, DY + y), s, font=f, fill=fill, anchor=anchor)
 
+    def centered(x, s, f):
+        """水平居中于 x(la 锚 + 动态测宽),任何字体下都不会右溢出。"""
+        return x - d.textlength(s, font=f) / 2
+
     # 标题栏
     d.rectangle([DX, DY, DX + 600 - 1, DY + 56], fill=0)
     text(300, 28, "F1  DASHBOARD", font(True, 34), fill=255, anchor="mm")
@@ -330,59 +338,61 @@ def png_render(data, out=SS_OUT):
     else:
         next_race = data["next_race"]
         if next_race is not None:
-            # NEXT RACE + 倒计时,赛道图在右侧
+            # NEXT RACE + 倒计时,赛道图在右侧;文本水平居中于 x=240,
+            # 动态测宽,保证不撞右侧轨道图框(左边界 x=460)
             text(20, 64, "NEXT RACE", font(True, 22))
-            text(240, 98, next_race["raceName"], font(True, 30), anchor="mm")
-            text(240, 134, "Round %s | %s" % (next_race["round"], next_race["date"]),
-                 font(False, 20), anchor="mm")
+            text(centered(240, next_race["raceName"], font(True, 30)), 98,
+                 next_race["raceName"], font(True, 30))
+            text(centered(240, "Round %s | %s" % (next_race["round"], next_race["date"]),
+                          font(False, 20)),
+                 140, "Round %s | %s" % (next_race["round"], next_race["date"]),
+                 font(False, 20))
             if data["countdown"]:
-                text(240, 162, data["countdown"], font(True, 20), anchor="mm")
-            d.rectangle([DX + 460, DY + 64, DX + 590, DY + 196], outline=160)
+                text(centered(240, data["countdown"], font(True, 20)), 172,
+                     data["countdown"], font(True, 20))
+            d.rectangle([DX + 460, DY + 64, DX + 590, DY + 190], outline=160)
             pts = get_track(next_race["Circuit"]["circuitId"])
             if pts:
-                draw_track(d, (460, 64, 590, 196), pts)
+                draw_track(d, (460, 64, 590, 190), pts)
         else:
             text(300, 120, "SEASON COMPLETE", font(True, 30), anchor="mm")
 
         # 赛季进度条(11/23 放进度条右侧,避开右侧赛道图框区域 x460-590)
+        # 进度条位置按文本实际 ink 底动态定位(bb 是画布坐标,记得 -DY 转回设计区),
+        # 字体度量变化也不会与文字重叠
         done, total = data["progress"] or (0, 0)
-        text(20, 186, "SEASON PROGRESS", font(False, 18))
-        d.rectangle([DX + 20, DY + 184, DX + 320, DY + 190], outline=160)
+        text(20, 204, "SEASON PROGRESS", font(False, 18))
+        prog_y = d.textbbox((DX + 20, DY + 204), "SEASON PROGRESS",
+                            font=font(False, 18))[3] - DY + 6
+        d.rectangle([DX + 20, DY + prog_y, DX + 320, DY + prog_y + 6], outline=160)
         if total:
-            d.rectangle([DX + 20, DY + 184,
-                         DX + 20 + int(300.0 * done / total), DY + 190], fill=0)
-        text(330, 186, "%d/%d" % (done, total), font(False, 18))
+            d.rectangle([DX + 20, DY + prog_y,
+                         DX + 20 + int(300.0 * done / total), DY + prog_y + 6], fill=0)
+        text(330, 204, "%d/%d" % (done, total), font(False, 18))
 
-        # 两栏榜单(行内积分条,与榜首归一化)
-        def render_list(rows, x0, pts_x, leader_pts):
-            y = 236
+        # 两栏榜单(车手/车队各 8 行)
+        def render_list(rows, x0, pts_x):
+            y = 278
             for pos, name, pts in rows:
-                text(x0, y, "%2s" % pos, font(True, 20), anchor="lm")
-                text(x0 + 30, y, name, font(False, 20), anchor="lm")
-                text(pts_x, y, "%4s" % pts, font(True, 20), anchor="rm")
-                if leader_pts:
-                    bar_w = int(int(pts) * 208 / leader_pts)
-                    if bar_w > 0:
-                        d.rectangle([DX + x0 + 30, DY + y + 14,
-                                     DX + x0 + 30 + bar_w, DY + y + 18], fill=160)
+                text(x0, y, "%2s" % pos, font(True, 20))
+                text(x0 + 30, y, name, font(False, 20))
+                text(pts_x, y, "%4s" % pts, font(True, 20), anchor="ra")
                 y += 30
 
-        text(20, 204, "DRIVER STANDINGS", font(True, 22))
-        text(320, 204, "CONSTRUCTOR", font(True, 22))
-        render_list(data["standings"], 20, 288,
-                    int(data["standings"][0][2]) if data["standings"] else 0)
-        render_list(data["constructors"], 320, 588,
-                    int(data["constructors"][0][2]) if data["constructors"] else 0)
+        text(20, 246, "DRIVER STANDINGS", font(True, 22))
+        text(320, 246, "CONSTRUCTOR", font(True, 22))
+        render_list(data["standings"], 20, 288)
+        render_list(data["constructors"], 320, 588)
 
         # 上场比赛 Top 5
         last_race = data["last_race"]
         if last_race:
-            text(20, 496, "LAST RACE | %s" % last_race["raceName"].upper(), font(True, 22))
-            y = 528
+            text(20, 522, "LAST RACE | %s" % last_race["raceName"].upper(), font(True, 22))
+            y = 554
             for pos, name, gap in data["last_results"]:
-                text(20, y, "%2s" % pos, font(True, 20), anchor="lm")
-                text(50, y, name, font(False, 20), anchor="lm")
-                text(440, y, gap, font(False, 18), anchor="rm")
+                text(20, y, "%2s" % pos, font(True, 20))
+                text(50, y, name, font(False, 20))
+                text(440, y, gap, font(False, 18), anchor="ra")
                 y += 32
 
     text(20, 760, "Last update %s" % data["upd"], font(False, 20))
