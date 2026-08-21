@@ -24,12 +24,16 @@
 +------------------------------------------+
 ```
 
+> 赛事周末(距开赛 <3 天)时,上面的仪表盘会被替换为**赛事海报**:
+> 大号赛道轮廓作主角 + 比赛名/地点 + 大字倒计时,氛围更浓。
+
 数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,免费、无需 Key)。赛道轮廓图形来自 [F1DB circuit assets](https://github.com/f1db/f1db/tree/main/src/assets/circuits)(Jules Roy,CC BY 4.0);赛车剪影图标来自 [game-icons.net](https://game-icons.net)(Skoll,CC BY 3.0)。无服务端、无 Docker,全部运行在 Kindle 本机。
 
 ## 功能
 
 - **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后 2 秒内自动刷新
-- **屏保内容**:下一场比赛(含倒计时)、赛季进度条、车手积分榜 Top 8、车队积分榜 Top 8、上一场比赛结果 Top 5、下一场赛道轮廓图、F1 赛车剪影与字标
+- **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字倒计时,替代日常信息密集的仪表盘;赛程剩余 >3 天时自动回到仪表盘
+- **屏保内容(仪表盘)**:下一场比赛(含倒计时)、赛季进度条、车手积分榜 Top 8、车队积分榜 Top 8、上一场比赛结果 Top 5、下一场赛道轮廓图、F1 赛车剪影与字标
 - **临时查看**:KUAL 里一键 Refresh Now,屏幕直接显示
 - **自动刷新**:清醒时每 30 分钟刷新一次
 - **局部降级**:任一数据接口失败只影响对应区块(显示 no data),页面整体存活
@@ -110,6 +114,8 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 
 - 数据直连 [Jolpica F1](https://api.jolpi.ca/ergast/f1/)(HTTPS,Python 自带 certifi 证书)
 - 屏保图片 758x1024 PNG,显示时等比缩放到 600x800 屏幕
+- **赛事海报触发**:`race_poster_active()` 判 `下一场开赛时间 - 现在 <= 3 天`,命中则渲染反色海报;
+  赛道名/倒计时用 `fit()` 动态缩字,任何赛道名(如 "United States Grand Prix")都不会溢出
 - 守护进程每 3 秒轮询 `powerd state`,唤醒即刷新
 - 本设备(PW1 5.6.1.1)外部 RTC 闹钟无法唤醒挂起内核,故不做"休眠中定时刷新"
 - 详见 [`docs/项目说明.md`](docs/项目说明.md) §6 踩坑记录

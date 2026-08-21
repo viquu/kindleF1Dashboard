@@ -43,6 +43,7 @@ FONT_MED = "/usr/java/lib/fonts/Futura-Medium.ttf"
 TOP_DRIVERS = 8
 TOP_CONSTRUCTORS = 8
 TOP_RESULTS = 5
+RACE_POSTER_WINDOW = 3 * 24 * 3600  # 距下一场开赛 <3 天(含比赛进行中)切赛事海报
 TRACKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracks.json")
 CAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "car.json")
 
@@ -143,6 +144,26 @@ def season_progress(races, next_race, last_race):
     else:
         done = 0
     return (done, total)
+
+
+def race_poster_active(data):
+    """距下一场开赛 <RACE_POSTER_WINDOW(含比赛进行中)时,屏保切赛事海报。"""
+    nr = data.get("next_race")
+    if nr is None:
+        return False
+    ts = race_start_ts(nr)
+    if ts is None:
+        return False
+    return ts - time.time() <= RACE_POSTER_WINDOW
+
+
+def format_race_daytime(race):
+    """比赛日短句(北京时间 UTC+8),如 'SUNDAY 21:00';日期/时间缺失返回 None。"""
+    ts = race_start_ts(race)
+    if ts is None:
+        return None
+    bj = time.gmtime(ts + 8 * 3600)
+    return "%s %02d:%02d" % (time.strftime("%A", bj).upper(), bj.tm_hour, bj.tm_min)
 
 
 _tracks = None
@@ -331,6 +352,28 @@ def draw_track(d, box, pts):
     d.line(xy, fill=0, width=2, joint="curve")
 
 
+def draw_track_fit(d, box, pts, fill=0, width=3):
+    """赛道轮廓按实际 bbox 等比填入 box(避开 1000 网格的留白,赛事海报主角用)。
+
+    返回 (ox, oy, s) 变换供调用方定位赛道上的附加元素;无 pts 时返回 None。
+    """
+    if not pts:
+        return None
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    cw, ch = max(maxx - minx, 1), max(maxy - miny, 1)
+    s = min(w / float(cw), h / float(ch))
+    ox = DX + x0 + (w - cw * s) / 2 - minx * s
+    oy = DY + y0 + (h - ch * s) / 2 - miny * s
+    d.line([(ox + p[0] * s, oy + p[1] * s) for p in pts],
+           fill=fill, width=width, joint="curve")
+    return (ox, oy, s)
+
+
 def draw_car(d, box, rings, fill=0):
     """赛车实心剪影:rings 为闭合环数组(0-1000 网格),box 为设计区坐标。
 
@@ -351,33 +394,8 @@ def draw_car(d, box, rings, fill=0):
         d.polygon([(ox + p[0] * s, oy + p[1] * s) for p in ring], fill=fill)
 
 
-def png_render(data, out=SS_OUT):
-    # 主数据源(current.json)拉取失败时不覆盖屏保图,保留上一张成功的画面;
-    # 仅当显式 --out 指向调试路径时才允许把失败态渲染出来。
-    if data["err"] is not None and out == SS_OUT:
-        print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
-        return False
-
-    img = Image.new("L", SS_SIZE, 255)
-    d = ImageDraw.Draw(img)
-
-    def font(bold, size):
-        # Kindle 用 Futura;开发机无此字体时退回 Helvetica/macOS 内置
-        for path in (FONT_BOLD if bold else FONT_MED,
-                     "/System/Library/Fonts/Helvetica.ttc"):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-
-    def text(x, y, s, f, fill=0, anchor="la"):
-        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor=anchor)
-
-    def centered(x, s, f):
-        """水平居中于 x(la 锚 + 动态测宽),任何字体下都不会右溢出。"""
-        return x - d.textlength(s, font=f) / 2
-
+def _draw_dashboard(d, data, font, text, centered):
+    """默认仪表盘版式(非赛事周末):标题栏 + 下一场 + 进度 + 榜单 + 上场比赛。"""
     # 标题栏:左侧白色赛车剪影 + 居中 DASHBOARD + 右侧 "F1" 字标/斜纹
     d.rectangle([DX, DY, DX + 600 - 1, DY + 56], fill=0)
     car = get_car()
@@ -451,6 +469,95 @@ def png_render(data, out=SS_OUT):
                 text(50, y, name, font(False, 20))
                 text(440, y, gap, font(False, 18), anchor="ra")
                 y += 32
+
+
+def _draw_poster(d, data, font, text, centered):
+    """赛事海报版式(距下一场开赛 <RACE_POSTER_WINDOW):赛道轮廓主角 + 大字倒计时。"""
+    def cmm(x, y, s, f, fill):
+        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor="mm")
+
+    def rm(x, y, s, f, fill):
+        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor="rm")
+
+    def fit(bold, s, max_w, start, min_size=16):
+        """自动缩小字号直到文字宽度 <= max_w,任何赛道名/倒计时都不溢出。"""
+        size = start
+        f = font(bold, size)
+        while size > min_size and d.textlength(s, font=f) > max_w:
+            size -= 2
+            f = font(bold, size)
+        return f
+
+    nr = data["next_race"]
+    # 标题栏(反色):赛车剪影 + F1 字标 + 斜纹 + ROUND
+    d.rectangle([DX, DY, DX + 600 - 1, DY + 52], fill=0)
+    car = get_car()
+    if car:
+        draw_car(d, (8, 8, 150, 44), car, fill=255)
+    cmm(255, 26, "F1", font(True, 30), 255)
+    d.line([DX + 300, DY + 12, DX + 316, DY + 2], fill=255, width=2)
+    d.line([DX + 322, DY + 12, DX + 338, DY + 2], fill=255, width=2)
+    rm(575, 26, "ROUND %s" % nr["round"], font(True, 22), 255)
+
+    # 反色大赛海报区
+    d.rectangle([DX, DY + 64, DX + 600 - 1, DY + 540], fill=0)
+    # 大号赛道轮廓(白线,主角)
+    pts = get_track(nr["Circuit"]["circuitId"])
+    if pts:
+        draw_track_fit(d, (120, 100, 480, 348), pts, fill=255, width=3)
+    # 比赛名(自动缩字) + 地点 · 国家
+    name = nr["raceName"].upper()
+    cmm(300, 392, name, fit(True, name, 520, 40), 255)
+    loc = nr.get("Circuit", {}).get("Location", {})
+    place = "%s · %s" % (loc.get("locality", ""), loc.get("country", ""))
+    if place.strip(" ·"):
+        cmm(300, 434, place, font(False, 22), 255)
+    # 大字倒计时(记分牌式)
+    cd = data["countdown"] or "RACE LIVE"
+    cmm(300, 492, cd, fit(True, cd, 530, 52), 255)
+
+    # 海报表之下:分隔线 + 比赛日/时间 + 赛季进度
+    d.line([DX + 60, DY + 566, DX + 540, DY + 566], fill=0, width=2)
+    day = format_race_daytime(nr)
+    if day:
+        cmm(300, 606, day, font(True, 28), 0)
+    done, total = data["progress"] or (0, 0)
+    if total:
+        cmm(300, 656, "Season %d / %d" % (done, total), font(False, 22), 0)
+
+
+def png_render(data, out=SS_OUT):
+    # 主数据源(current.json)拉取失败时不覆盖屏保图,保留上一张成功的画面;
+    # 仅当显式 --out 指向调试路径时才允许把失败态渲染出来。
+    if data["err"] is not None and out == SS_OUT:
+        print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
+        return False
+
+    img = Image.new("L", SS_SIZE, 255)
+    d = ImageDraw.Draw(img)
+
+    def font(bold, size):
+        # Kindle 用 Futura;开发机无此字体时退回 Helvetica/macOS 内置
+        for path in (FONT_BOLD if bold else FONT_MED,
+                     "/System/Library/Fonts/Helvetica.ttc"):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+
+    def text(x, y, s, f, fill=0, anchor="la"):
+        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor=anchor)
+
+    def centered(x, s, f):
+        """水平居中于 x(la 锚 + 动态测宽),任何字体下都不会右溢出。"""
+        return x - d.textlength(s, font=f) / 2
+
+    # 赛事周末(距下一场开赛 <3 天)切海报,否则默认仪表盘
+    if race_poster_active(data):
+        _draw_poster(d, data, font, text, centered)
+    else:
+        _draw_dashboard(d, data, font, text, centered)
 
     text(20, 760, "Last update %s" % data["upd"], font(False, 20))
     img.save(out)
@@ -533,12 +640,27 @@ def service_mode():
 
 # ---------------- 入口 ----------------
 
-def mock_data(err=False):
-    """离线假数据:png --mock / --mock-err 用,渲染不联网(开发机验证布局)。"""
-    next_race = {"raceName": "Dutch Grand Prix", "round": "12",
-                 "date": "2026-08-23",
-                 "Circuit": {"circuitId": "zandvoort"}}
-    last_race = {"raceName": "Hungarian Grand Prix", "round": "11"}
+def mock_data(err=False, poster=False):
+    """离线假数据:--mock(仪表盘)/ --mock-race(赛事海报)/ --mock-err 用,渲染不联网。
+
+    poster=True 时 next_race 落在赛事海报窗口内(距开赛 <3 天),倒计时由真实
+    时间差推导,便于开发机预览海报版式;否则取较远的收官战,预览仪表盘版式。
+    """
+    if poster:
+        next_race = {"raceName": "Dutch Grand Prix", "round": "12",
+                     "date": "2026-08-23", "time": "13:00:00Z",
+                     "Circuit": {"circuitId": "zandvoort",
+                                 "Location": {"locality": "Zandvoort",
+                                              "country": "Netherlands"}}}
+        last_race = {"raceName": "Hungarian Grand Prix", "round": "11"}
+    else:
+        next_race = {"raceName": "Abu Dhabi Grand Prix", "round": "23",
+                     "date": "2026-12-06", "time": "13:00:00Z",
+                     "Circuit": {"circuitId": "yas_marina",
+                                 "Location": {"locality": "Abu Dhabi",
+                                              "country": "United Arab Emirates"}}}
+        last_race = {"raceName": "Qatar Grand Prix", "round": "22"}
+    ts = race_start_ts(next_race)
     return {
         "next_race": None if err else next_race,
         "last_race": None if err else last_race,
@@ -555,7 +677,7 @@ def mock_data(err=False):
                          ("3", "Oscar Piastri", "+18.362"),
                          ("4", "Charles Leclerc", "+22.054"),
                          ("5", "George Russell", "Power Unit")],
-        "countdown": None if err else "in 7d 06h",
+        "countdown": None if err else fmt_countdown(ts),
         "progress": None if err else (11, 23),
         "upd": "12:34",
         "err": Exception("network unreachable") if err else None,
@@ -573,6 +695,8 @@ def main():
         return 0
     if "--mock" in argv:
         data = mock_data(err=False)
+    elif "--mock-race" in argv:
+        data = mock_data(err=False, poster=True)
     elif "--mock-err" in argv:
         data = mock_data(err=True)
     else:
