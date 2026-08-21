@@ -352,6 +352,12 @@ def draw_car(d, box, rings, fill=0):
 
 
 def png_render(data, out=SS_OUT):
+    # 主数据源(current.json)拉取失败时不覆盖屏保图,保留上一张成功的画面;
+    # 仅当显式 --out 指向调试路径时才允许把失败态渲染出来。
+    if data["err"] is not None and out == SS_OUT:
+        print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
+        return False
+
     img = Image.new("L", SS_SIZE, 255)
     d = ImageDraw.Draw(img)
 
@@ -382,6 +388,7 @@ def png_render(data, out=SS_OUT):
     for x in (462, 479, 496):
         d.line([DX + x, DY + 44, DX + x + 16, DY + 10], fill=255, width=2)
 
+    # 走到这里 data["err"] 非空只可能是显式 --out 调试路径
     if data["err"] is not None:
         text(300, 380, "FETCH FAILED", font(True, 32), anchor="mm")
         text(300, 430, str(data["err"])[:60], font(False, 20), anchor="mm")
@@ -448,6 +455,7 @@ def png_render(data, out=SS_OUT):
     text(20, 760, "Last update %s" % data["upd"], font(False, 20))
     img.save(out)
     print("saved:", out, img.size, img.mode)
+    return True
 
 
 # ---------------- 守护进程(service) ----------------
@@ -482,9 +490,11 @@ def service_mode():
 
     # 启动即刷新一次(确保屏保图是最新的)
     try:
-        png_render(get_dashboard_data())
-        last_refresh = time.time()
-        log("initial refresh done")
+        if png_render(get_dashboard_data()):
+            last_refresh = time.time()
+            log("initial refresh done")
+        else:
+            log("initial fetch failed; kept previous screensaver")
     except Exception as exc:
         log("initial refresh failed: %r" % exc)
 
@@ -499,17 +509,21 @@ def service_mode():
             if last_state not in ("active", "ready"):
                 # 刚唤醒:立即刷新
                 try:
-                    png_render(get_dashboard_data())
-                    last_refresh = now
-                    log("wake refresh done")
+                    if png_render(get_dashboard_data()):
+                        last_refresh = now
+                        log("wake refresh done")
+                    else:
+                        log("wake fetch failed; kept previous screensaver")
                 except Exception as exc:
                     log("wake refresh failed: %r" % exc)
             elif now - last_refresh >= SERVICE_INTERVAL:
                 # 清醒中定期刷新
                 try:
-                    png_render(get_dashboard_data())
-                    last_refresh = now
-                    log("periodic refresh done")
+                    if png_render(get_dashboard_data()):
+                        last_refresh = now
+                        log("periodic refresh done")
+                    else:
+                        log("periodic fetch failed; kept previous screensaver")
                 except Exception as exc:
                     log("periodic refresh failed: %r" % exc)
 
