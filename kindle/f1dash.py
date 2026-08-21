@@ -32,10 +32,30 @@ from PIL import Image, ImageDraw, ImageFont
 API_BASE = "https://api.jolpi.ca/ergast/f1/"
 FBINK = "/mnt/us/bin/fbink"
 
-# 屏保图片规格(linkss):758x1024,内容画在中央 600x800 设计区
+# 屏保图片规格(linkss):758x1024,与 KPW1 物理屏 1:1 对应。
+# 全屏铺满:内容不再只画在居中 600×800 设计区(原 DX=79/DY=112 会在四周留 ~10% 白边),
+# 而是把 600×800 设计网格按 FULL_SCALE 等比放大到整个画布,仅留极细边距避免顶到面板边。
 SS_SIZE = (758, 1024)
 SS_OUT = "/mnt/us/linkss/screensavers/bg_ss00.png"
-DX, DY = 79, 112  # 设计区在画布中的偏移
+DX, DY = 0, 0
+FULL_SCALE = 1.24
+FX = round((SS_SIZE[0] - 600 * FULL_SCALE) / 2)   # ≈7
+FY = round((SS_SIZE[1] - 800 * FULL_SCALE) / 2)   # ≈16
+
+
+def fs(x):
+    """设计区 x 坐标 → 画布 x 坐标(等比放大 + 居中偏移)。"""
+    return round(x * FULL_SCALE + FX)
+
+
+def fy(y):
+    """设计区 y 坐标 → 画布 y 坐标(等比放大 + 居中偏移)。"""
+    return round(y * FULL_SCALE + FY)
+
+
+def fbox(x0, y0, x1, y1):
+    """设计区 box → 画布 box(传给 draw_track / draw_car / draw_track_fit)。"""
+    return (fs(x0), fy(y0), fs(x1), fy(y1))
 
 FONT_BOLD = "/usr/java/lib/fonts/Futura-Bold.ttf"
 FONT_MED = "/usr/java/lib/fonts/Futura-Medium.ttf"
@@ -397,14 +417,14 @@ def draw_car(d, box, rings, fill=0):
 def _draw_dashboard(d, data, font, text, centered):
     """默认仪表盘版式(非赛事周末):标题栏 + 下一场 + 进度 + 榜单 + 上场比赛。"""
     # 标题栏:左侧白色赛车剪影 + 居中 DASHBOARD + 右侧 "F1" 字标/斜纹
-    d.rectangle([DX, DY, DX + 600 - 1, DY + 56], fill=0)
+    d.rectangle([fs(0), fy(0), fs(600) - 1, fy(56)], fill=0)
     car = get_car()
     if car:
-        draw_car(d, (8, 10, 158, 46), car, fill=255)
+        draw_car(d, fbox(8, 10, 158, 46), car, fill=255)
     text(300, 28, "DASHBOARD", font(True, 34), fill=255, anchor="mm")
     text(575, 28, "F1", font(True, 30), fill=255, anchor="rm")
     for x in (462, 479, 496):
-        d.line([DX + x, DY + 44, DX + x + 16, DY + 10], fill=255, width=2)
+        d.line([fs(x), fy(44), fs(x + 16), fy(10)], fill=255, width=2)
 
     # 走到这里 data["err"] 非空只可能是显式 --out 调试路径
     if data["err"] is not None:
@@ -425,24 +445,24 @@ def _draw_dashboard(d, data, font, text, centered):
             if data["countdown"]:
                 text(centered(240, data["countdown"], font(True, 20)), 172,
                      data["countdown"], font(True, 20))
-            d.rectangle([DX + 460, DY + 64, DX + 590, DY + 190], outline=160)
+            d.rectangle([fs(460), fy(64), fs(590), fy(190)], outline=160)
             pts = get_track(next_race["Circuit"]["circuitId"])
             if pts:
-                draw_track(d, (460, 64, 590, 190), pts)
+                draw_track(d, fbox(460, 64, 590, 190), pts)
         else:
             text(300, 120, "SEASON COMPLETE", font(True, 30), anchor="mm")
 
         # 赛季进度条(11/23 放进度条右侧,避开右侧赛道图框区域 x460-590)
-        # 进度条位置按文本实际 ink 底动态定位(bb 是画布坐标,记得 -DY 转回设计区),
+        # 进度条位置按文本实际 ink 底动态定位(bb 是画布坐标,记得 -FY 转回设计区),
         # 字体度量变化也不会与文字重叠
         done, total = data["progress"] or (0, 0)
         text(20, 204, "SEASON PROGRESS", font(False, 18))
-        prog_y = d.textbbox((DX + 20, DY + 204), "SEASON PROGRESS",
-                            font=font(False, 18))[3] - DY + 6
-        d.rectangle([DX + 20, DY + prog_y, DX + 320, DY + prog_y + 6], outline=160)
+        prog_y = (d.textbbox((fs(20), fy(204)), "SEASON PROGRESS",
+                             font=font(False, 18))[3] - FY) / FULL_SCALE + 6
+        d.rectangle([fs(20), fy(prog_y), fs(320), fy(prog_y + 6)], outline=160)
         if total:
-            d.rectangle([DX + 20, DY + prog_y,
-                         DX + 20 + int(300.0 * done / total), DY + prog_y + 6], fill=0)
+            d.rectangle([fs(20), fy(prog_y),
+                         fs(20 + 300.0 * done / total), fy(prog_y + 6)], fill=0)
         text(330, 204, "%d/%d" % (done, total), font(False, 18))
 
         # 两栏榜单(车手/车队各 8 行)
@@ -474,37 +494,37 @@ def _draw_dashboard(d, data, font, text, centered):
 def _draw_poster(d, data, font, text, centered):
     """赛事海报版式(距下一场开赛 <RACE_POSTER_WINDOW):赛道轮廓主角 + 大字倒计时。"""
     def cmm(x, y, s, f, fill):
-        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor="mm")
+        d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor="mm")
 
     def rm(x, y, s, f, fill):
-        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor="rm")
+        d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor="rm")
 
     def fit(bold, s, max_w, start, min_size=16):
         """自动缩小字号直到文字宽度 <= max_w,任何赛道名/倒计时都不溢出。"""
         size = start
         f = font(bold, size)
-        while size > min_size and d.textlength(s, font=f) > max_w:
+        while size > min_size and d.textlength(s, font=f) / FULL_SCALE > max_w:
             size -= 2
             f = font(bold, size)
         return f
 
     nr = data["next_race"]
     # 标题栏(反色):赛车剪影 + F1 字标 + 斜纹 + ROUND
-    d.rectangle([DX, DY, DX + 600 - 1, DY + 52], fill=0)
+    d.rectangle([fs(0), fy(0), fs(600) - 1, fy(52)], fill=0)
     car = get_car()
     if car:
-        draw_car(d, (8, 8, 150, 44), car, fill=255)
+        draw_car(d, fbox(8, 8, 150, 44), car, fill=255)
     cmm(255, 26, "F1", font(True, 30), 255)
-    d.line([DX + 300, DY + 12, DX + 316, DY + 2], fill=255, width=2)
-    d.line([DX + 322, DY + 12, DX + 338, DY + 2], fill=255, width=2)
+    d.line([fs(300), fy(12), fs(316), fy(2)], fill=255, width=2)
+    d.line([fs(322), fy(12), fs(338), fy(2)], fill=255, width=2)
     rm(575, 26, "ROUND %s" % nr["round"], font(True, 22), 255)
 
     # 反色大赛海报区
-    d.rectangle([DX, DY + 64, DX + 600 - 1, DY + 540], fill=0)
+    d.rectangle([fs(0), fy(64), fs(600) - 1, fy(540)], fill=0)
     # 大号赛道轮廓(白线,主角)
     pts = get_track(nr["Circuit"]["circuitId"])
     if pts:
-        draw_track_fit(d, (120, 100, 480, 348), pts, fill=255, width=3)
+        draw_track_fit(d, fbox(120, 100, 480, 348), pts, fill=255, width=3)
     # 比赛名(自动缩字) + 地点 · 国家
     name = nr["raceName"].upper()
     cmm(300, 392, name, fit(True, name, 520, 40), 255)
@@ -517,7 +537,7 @@ def _draw_poster(d, data, font, text, centered):
     cmm(300, 492, cd, fit(True, cd, 530, 52), 255)
 
     # 海报表之下:分隔线 + 比赛日/时间 + 赛季进度
-    d.line([DX + 60, DY + 566, DX + 540, DY + 566], fill=0, width=2)
+    d.line([fs(60), fy(566), fs(540), fy(566)], fill=0, width=2)
     day = format_race_daytime(nr)
     if day:
         cmm(300, 606, day, font(True, 28), 0)
@@ -538,20 +558,21 @@ def png_render(data, out=SS_OUT):
 
     def font(bold, size):
         # Kindle 用 Futura;开发机无此字体时退回 Helvetica/macOS 内置
+        # 字号按 FULL_SCALE 等比放大,保证真正铺满 758×1024 画布
         for path in (FONT_BOLD if bold else FONT_MED,
                      "/System/Library/Fonts/Helvetica.ttc"):
             try:
-                return ImageFont.truetype(path, size)
+                return ImageFont.truetype(path, max(1, round(size * FULL_SCALE)))
             except Exception:
                 continue
         return ImageFont.load_default()
 
     def text(x, y, s, f, fill=0, anchor="la"):
-        d.text((DX + x, DY + y), s, font=f, fill=fill, anchor=anchor)
+        d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor=anchor)
 
     def centered(x, s, f):
         """水平居中于 x(la 锚 + 动态测宽),任何字体下都不会右溢出。"""
-        return x - d.textlength(s, font=f) / 2
+        return x - (d.textlength(s, font=f) / FULL_SCALE) / 2
 
     # 赛事周末(距下一场开赛 <3 天)切海报,否则默认仪表盘
     if race_poster_active(data):
