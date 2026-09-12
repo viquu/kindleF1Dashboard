@@ -25,16 +25,17 @@
 ```
 
 > 赛事周末(距开赛 <3 天)时,上面的仪表盘会被替换为**赛事海报**:
-> 大号赛道轮廓作主角 + 比赛名/地点 + 大字倒计时,氛围更浓。
+> 大号赛道轮廓作主角 + 比赛名/地点 + 大字倒计时,氛围更浓;
+> 周末里排位赛/冲刺赛结束后,海报**渐进**补出对应赛果(Top 5),正赛前更"有用"。
 
 数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,免费、无需 Key)。赛道轮廓图形来自 [F1DB circuit assets](https://github.com/f1db/f1db/tree/main/src/assets/circuits)(Jules Roy,CC BY 4.0);赛车剪影图标来自 [game-icons.net](https://game-icons.net)(Skoll,CC BY 3.0)。无服务端、无 Docker,全部运行在 Kindle 本机。
 
 ## 功能
 
 - **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后 2 秒内自动刷新
-- **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字倒计时,替代日常信息密集的仪表盘;赛程剩余 >3 天时自动回到仪表盘
+- **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字倒计时,替代日常信息密集的仪表盘;周末里排位赛/冲刺赛结束后**渐进**补出对应赛果(Top 5),正赛前信息更有用;赛程剩余 >3 天时自动回到仪表盘
 - **屏保内容(仪表盘)**:下一场比赛(含倒计时)、赛季进度条、车手积分榜 Top 8、车队积分榜 Top 8、上一场比赛结果 Top 5、下一场赛道轮廓图、F1 赛车剪影与字标
-- **临时查看**:KUAL 里一键 Refresh Now,屏幕直接显示
+- **刷新屏保**:KUAL 里一键 Refresh Now,立即重新生成屏保图(下次休眠显示)
 - **自动刷新**:清醒时每 30 分钟刷新一次
 - **局部降级**:任一数据接口失败只影响对应区块(显示 no data),页面整体存活
 - 完全不影响正常阅读(屏保模式实现,无常驻界面)
@@ -50,7 +51,6 @@
 | **MRPI / MRInstaller** | 安装 .bin 包 | KUAL 配套 |
 | **kindle-python**(NiLuJe) | Python 3.9 + Pillow + certifi(必需,选 `touch_pw` 版本) | [MobileRead t=225030](https://www.mobileread.com/forums/showthread.php?t=225030) |
 | **linkss**(ScreenSavers Hack) | 自定义屏保(信息牌模式必需,选 `touch_pw` 版本) | [bookfere 指南](https://bookfere.com/post/311.html) |
-| **FBInk** | 屏幕直显(仅临时查看模式需要) | [FBInk](https://github.com/NiLuJe/FBInk) |
 | usbnet(可选) | WiFi SSH,开发调试用 | 越狱配套 |
 
 > 两个 `.bin` 包都选 **`touch_pw`** 变体(Kindle Touch / Paperwhite 1),不是 `pw2_kt2_kv_pw3`。
@@ -75,7 +75,7 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 | 场景 | 操作 |
 |---|---|
 | 当信息牌摆着 | KUAL → **Start Service** → 按电源键休眠,屏保显示面板;之后每次唤醒自动刷新,再按电源键睡回去即可 |
-| 临时看一眼 | KUAL → **Refresh Now** → 屏幕直接显示 → Home 退出 |
+| 立即刷新屏保 | KUAL → **Refresh Now**(下次休眠显示新图) |
 | 停用服务 | KUAL → **Stop Service** |
 | 断网恢复 | KUAL → **Enable Wifi** |
 
@@ -99,7 +99,7 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 │   ├── make_tracks.py    # 开发机专用:SVG → tracks.json 转换与验证工具
 │   └── make_car.py       # 开发机专用:SVG → car.json(赛车剪影)转换与核对
 └── kindle/
-    ├── f1dash.py         # 主程序:show / png / service 三模式
+    ├── f1dash.py         # 主程序:png / service 两模式(无 FBInk 依赖)
     ├── tracks.json       # 23 条赛道轮廓坐标(F1DB,CC BY 4.0)
     ├── car.json          # F1 赛车剪影坐标(game-icons.net,CC BY 3.0)
     ├── rtc.py            # RTC 闹钟(备用代码,RTC 唤醒方案已确认不可行)
