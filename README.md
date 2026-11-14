@@ -2,42 +2,46 @@
 
 在闲置的 Kindle Paperwhite 1 上运行的 F1 信息牌:E-Ink 屏保显示下一场比赛、双积分榜、上场比赛结果和赛道轮廓,唤醒自动刷新,不影响正常阅读。
 
+渲染在 Oracle Cloud 云端完成(systemd timer 定时出图 + nginx 静态服务),Kindle 只在唤醒时下载成图——唤醒刷新从几十秒压到几秒,配合"一键回睡"按一下电源键就能看到最新锁屏。
+
 ```
-+----------------------------+-------------+
-| 🏎️ DASHBOARD        /// F1 |             |  ← 顶栏左侧白色赛车剪影
-| NEXT RACE                  |  赛道轮廓图  |
-| Dutch Grand Prix           |             |
-| Round 12 | 2026-08-23      |             |
-| in 7d 06h                  |             |
-| SEASON PROGRESS ▓▓▓▓░░ 11/23             |
-+------------------+-----------------------+
-| DRIVER STANDINGS | CONSTRUCTOR           |
-| 1 Antonelli  219 | 1 Mercedes     379    |
-| 2 Hamilton   169 | 2 Ferrari      307    |
-| ...              | ...                   |
-+------------------+-----------------------+
-| LAST RACE | HUNGARIAN GRAND PRIX         |
-| 1 L. Norris    1:39:56.180               |
-| 2 M. Verstappen +15.080                 |
-+------------------------------------------+
-| Last update 11:16                        |
-+------------------------------------------+
++------------------------------------------------+
+| 🪖 DASHBOARD                             <F1标> |  ← 页眉:头盔图标 + 官方 F1 徽标
+| NEXT RACE · ROUND 21      |   赛道轮廓图(主角)  |
+| LAS VEGAS                 |                    |
+| GRAND PRIX                |                    |
++------------------------------------------------+
+| LIGHTS OUT · UTC+8                             |
+| NOV 22 · SUNDAY 12:00                          |  ← 反色开赛时刻板
++------------------------------------------------+
+| SEASON 2026  ▮▮▮▮▮▮▮▮▮▯▯  20/23                |
++----------------------+-------------------------+
+| DRIVER STANDINGS     | CONSTRUCTOR STANDINGS   |
+| 1 ANTONELLI      390 | 1 MERCEDES        652   |
+| 2 VERSTAPPEN -111 279 | 2 FERRARI      -142 510 |
+| ...                  | ...                     |
++----------------------+-------------------------+
+| LAST RACE · BRAZILIAN                          |
+| 1 NORRIS                          1:35:23.504  |
+| Last update 14:15                              |
++------------------------------------------------+
 ```
 
 > 赛事周末(距开赛 <3 天)时,上面的仪表盘会被替换为**赛事海报**:
-> 大号赛道轮廓作主角 + 比赛名/地点 + 大字倒计时,氛围更浓;
+> 大号赛道轮廓作主角 + 比赛名/地点 + 大字开赛时刻,氛围更浓;
 > 周末里排位赛/冲刺赛结束后,海报**渐进**补出对应赛果(Top 5),正赛前更"有用"。
 
-数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,免费、无需 Key)。赛道轮廓图形来自 [F1DB circuit assets](https://github.com/f1db/f1db/tree/main/src/assets/circuits)(Jules Roy,CC BY 4.0);赛车剪影图标来自 [game-icons.net](https://game-icons.net)(Skoll,CC BY 3.0)。无服务端、无 Docker,全部运行在 Kindle 本机。
+数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,免费、无需 Key)。赛道轮廓图形来自 [F1DB circuit assets](https://github.com/f1db/f1db/tree/main/src/assets/circuits)(Jules Roy,CC BY 4.0);页眉头盔图标来自 [Material Design Icons](https://pictogrammers.com)(Pictogrammers,Apache 2.0,`racing-helmet`);页眉 F1 徽标来自 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Formula_One_logo.svg)(Public domain;F1 徽标为 Formula One Group 注册商标,仅个人非商用显示)。渲染上移云端后,Kindle 只下载成图、不做本机渲染:云端不可达时直接保留最后一张屏保图。
 
 ## 功能
 
-- **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后 2 秒内自动刷新
-- **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字倒计时,替代日常信息密集的仪表盘;周末里排位赛/冲刺赛结束后**渐进**补出对应赛果(Top 5),正赛前信息更有用;赛程剩余 >3 天时自动回到仪表盘
-- **屏保内容(仪表盘)**:下一场比赛(含倒计时)、赛季进度条、车手积分榜 Top 8、车队积分榜 Top 8、上一场比赛结果 Top 5、下一场赛道轮廓图、F1 赛车剪影与字标
-- **刷新屏保**:KUAL 里一键 Refresh Now,立即重新生成屏保图(下次休眠显示)
+- **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后自动下载云端成图(秒级)
+- **一键回睡(Auto Sleep)**:信息牌模式下按一下电源键 → Kindle 秒级拉取新图 → 自动回睡,锁屏永远是最新的;想正常阅读时在 KUAL 菜单切回 OFF
+- **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字开赛时刻,替代日常信息密集的仪表盘;周末里排位赛/冲刺赛结束后**渐进**补出对应赛果(Top 5),正赛前信息更有用;赛程剩余 >3 天时自动回到仪表盘
+- **屏保内容(仪表盘)**:下一场比赛(开赛时刻板)、赛季进度刻度尺、车手积分榜 Top 10 与车队积分榜 Top 10(第 2 名起灰字标落后差距)、上场比赛领奖台 Top 3、下一场赛道轮廓图、赛车头盔图标与 F1 官方徽标
+- **刷新屏保**:KUAL 里一键 Refresh Now(下载云端成图,秒级)
 - **自动刷新**:清醒时每 30 分钟刷新一次
-- **局部降级**:任一数据接口失败只影响对应区块(显示 no data),页面整体存活
+- **局部降级**:任一数据接口失败只影响对应区块(显示 no data),页面整体存活;云端主数据源失败时保留上一张成功图,Kindle 端不做本机渲染
 - 完全不影响正常阅读(屏保模式实现,无常驻界面)
 
 ## 前置依赖(需先安装)
@@ -58,28 +62,42 @@
 
 ## 安装
 
-1. 把本仓库的 `kindle/` 下文件传到设备(SSH 或 USB):
+### 云端(Oracle Cloud,一次性)
 
 ```bash
-scp -r kindle/f1dash.py kindle/tracks.json kindle/car.json kindle/rtc.py kindle/make_ss_test.py root@<KINDLE_IP>:/mnt/us/f1dash/
+bash cloud/deploy.sh     # 渲染代码 + systemd timer(每 10 分钟)+ nginx(:8080)+ iptables
+```
+
+前置:本机 `~/.ssh/config` 有 `oracle` 别名(ubuntu + 免密 sudo);Oracle 控制台
+**VCN Security List 需放行 TCP 8080**(iptables 脚本里已放行,云防火墙需手动加)。
+可选:`bash cloud/sync_fonts.sh`(Kindle 在线时)把 Kindle 的 Futura 拷到云端当出图字体
+(几何风格与版式最搭);不拷则自动用 Jost(OFL 免费字体,版式自动适配)。
+
+### Kindle(SSH 或 USB)
+
+```bash
+scp -r kindle/f1dash.py kindle/tracks.json kindle/f1icon.json kindle/rtc.py kindle/make_ss_test.py root@<KINDLE_IP>:/mnt/us/f1dash/
 scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 ```
 
-> `tracks.json` 是 23 条赛道的轮廓坐标(赛道图形用),由 `tools/make_tracks.py` 从 F1DB 资产生成;`car.json` 是赛车剪影坐标(实心剪影用),由 `tools/make_car.py` 从 game-icons.net 生成。两者已随仓库提供,升级时保持和 `f1dash.py` 一起更新。
+> `tracks.json` 是赛道轮廓坐标(赛道图形用,由 `tools/make_tracks.py` 从 F1DB SVG 生成),
+> `f1icon.json` 是页眉头盔图标坐标(来自 MDI `racing-helmet`,由 `tools/make_icon.py` 生成),
+> 云端与 Kindle 两端都要有。
 
-2. 确认 `/mnt/us/extensions/f1/config.xml` 存在(KUAL 通过它识别扩展)
-3. 重启 Kindle(让 KUAL 重建菜单缓存),打开 KUAL 应看到 **F1 Dashboard** 菜单
+确认 `/mnt/us/extensions/f1/config.xml` 存在(KUAL 通过它识别扩展),
+重启 Kindle 让 KUAL 重建菜单缓存,打开 KUAL 应看到 **F1 Dashboard** 菜单。
 
 ## 使用
 
 | 场景 | 操作 |
 |---|---|
-| 当信息牌摆着 | KUAL → **Start Service** → 按电源键休眠,屏保显示面板;之后每次唤醒自动刷新,再按电源键睡回去即可 |
-| 立即刷新屏保 | KUAL → **Refresh Now**(下次休眠显示新图) |
+| 当信息牌摆着 | KUAL → **Start Service** → **Auto Sleep 切到 ON** → 按电源键休眠,屏保显示面板;之后按一下电源键,它自己拉新图并回睡,锁屏始终最新 |
+| 正常阅读 | KUAL → **Auto Sleep 切到 OFF**,唤醒后不再自动回睡 |
+| 立即刷新屏保 | KUAL → **Refresh Now**(优先拉云端成图,下次休眠显示新图) |
 | 停用服务 | KUAL → **Stop Service** |
 | 断网恢复 | KUAL → **Enable Wifi** |
 
-首次使用建议先 `Refresh Now` 确认能正常拉取数据。
+首次使用建议先 `Refresh Now` 确认能拉到云端图(`service.log` 里看 `wake refresh done (pull)`)。
 
 ## 常见问题
 
@@ -87,35 +105,51 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 |---|---|
 | KUAL 里没有 F1 Dashboard | 扩展缺 `config.xml` 或 KUAL 菜单缓存未刷新(重启 Kindle) |
 | 屏幕顶部被系统状态栏盖住 | 正常现象,状态栏归 Kindle 框架所有;内容从状态栏下方开始绘制 |
-| 屏保显示旧时间 | 屏保图只在唤醒时刷新;唤醒后等 3 秒再入睡即可(守护进程每 3 秒轮询状态) |
-| 显示 "FETCH FAILED" | 网络不通或 API 变动:确认 WiFi 已连;域名为 `api.jolpi.ca`(旧 `jolpica.com` 已失效) |
+| 唤醒后锁屏还是旧图 | 云端不可达时保留上一张(设备不做本机渲染);看 `/mnt/us/f1dash/service.log`,`wake refresh done (pull)` 才是拉图成功 |
+| Auto Sleep 把 Kindle 抢走 | 设计行为(信息牌模式);想阅读时 KUAL → Auto Sleep 切回 OFF |
+| 屏保内容缺块/过期 | 云端拉 Jolpica 数据失败时保留上一张成功图;`ssh oracle` 看 `journalctl -u f1dash-render.service`;域名为 `api.jolpi.ca`(旧 `jolpica.com` 已失效) |
+| 云端图不更新 | `ssh oracle` 看 `systemctl status f1dash-render.service` 与 nginx;公网拉不通先查 Oracle 控制台 VCN Security List 是否放行 8080 |
 | linkss 屏保失效 | usbnet 与 linkss 已知冲突,重装 linkss 恢复 |
 
 ## 项目结构
 
 ```
 ├── docs/项目说明.md      # 完整技术文档(架构、踩坑记录)
+├── cloud/
+│   ├── render.py         # 云端渲染入口(import kindle/f1dash.py 复用取数与渲染)
+│   ├── deploy.sh         # 一键部署到 Oracle(systemd timer + nginx + iptables)
+│   ├── sync_fonts.sh     # Kindle 在线时把 Futura 拷到云端(可选)
+│   ├── systemd/          # f1dash-render.service / .timer
+│   └── nginx/            # :8080 静态服务配置
 ├── tools/
 │   ├── make_tracks.py    # 开发机专用:SVG → tracks.json 转换与验证工具
-│   └── make_car.py       # 开发机专用:SVG → car.json(赛车剪影)转换与核对
+│   ├── make_icon.py      # 开发机专用:MDI 头盔图标 SVG → f1icon.json
+│   └── make_logo.py      # 开发机专用:F1 官方徽标 SVG → f1logo.json
 └── kindle/
-    ├── f1dash.py         # 主程序:png / service 两模式(无 FBInk 依赖)
-    ├── tracks.json       # 23 条赛道轮廓坐标(F1DB,CC BY 4.0)
-    ├── car.json          # F1 赛车剪影坐标(game-icons.net,CC BY 3.0)
+    ├── f1dash.py         # 主程序:png / pull / refresh / service 四模式
+    ├── tracks.json       # 赛道轮廓坐标(F1DB,CC BY 4.0)
+    ├── f1icon.json       # 页眉头盔图标坐标(MDI racing-helmet,Apache 2.0)
+    ├── f1logo.json       # F1 官方徽标坐标(Wikimedia Commons,Public domain)
     ├── rtc.py            # RTC 闹钟(备用代码,RTC 唤醒方案已确认不可行)
     ├── make_ss_test.py   # 屏保定位测试图生成器
     └── extensions/f1/    # KUAL 插件,部署到 /mnt/us/extensions/f1/
         ├── config.xml    # 扩展注册(必需)
-        ├── menu.json     # 菜单定义
-        └── bin/          # refresh / start / stop 脚本
+        ├── menu.json     # 菜单定义(含 Auto Sleep 开关)
+        └── bin/          # refresh / autosleep_toggle / start / stop 脚本
 ```
 
 ## 技术要点
 
-- 数据直连 [Jolpica F1](https://api.jolpi.ca/ergast/f1/)(HTTPS,Python 自带 certifi 证书)
-- 屏保图片 758x1024 PNG,显示时等比缩放到 600x800 屏幕
+- **云端渲染**:Oracle Cloud 上 systemd timer 每 10 分钟跑 `cloud/render.py`
+  (直接 import `kindle/f1dash.py`,渲染逻辑零分叉)→ `/opt/f1dash/out/latest.png`,
+  nginx 出 `http://<host>:8080/f1/latest.png`;渲染 4× 超采样再 LANCZOS 缩回,
+  线条/文字边缘抗锯齿;字体 Barlow Semi Condensed(仓库 `cloud/fonts/`,OFL)
+  为主,Futura 副本 / Jost 后备
+- **Kindle 瘦客户端**:守护进程每 3 秒轮询 `powerd state`,唤醒即 `pull` 云端成图
+  (PNG 魔数校验 + 原子替换 + 内容不变跳过写盘),云端不可达保留上一张屏保;
+  `auto_sleep` 标志存在且刷新成功时发 `lipc-set-prop com.lab126.powerd powerButton 1` 一键回睡
 - **赛事海报触发**:`race_poster_active()` 判 `下一场开赛时间 - 现在 <= 3 天`,命中则渲染反色海报;
-  赛道名/倒计时用 `fit()` 动态缩字,任何赛道名(如 "United States Grand Prix")都不会溢出
-- 守护进程每 3 秒轮询 `powerd state`,唤醒即刷新
-- 本设备(PW1 5.6.1.1)外部 RTC 闹钟无法唤醒挂起内核,故不做"休眠中定时刷新"
+  赛道名/开赛时刻用 `_fit()` 动态缩字,任何赛道名(如 "United States Grand Prix")都不会溢出
+- 本设备(PW1 5.6.1.1)外部 RTC 闹钟无法唤醒挂起内核,故不做"休眠中定时刷新";
+  设备睡着时云端图再新也刷不上去,这是硬件上限(详见 docs §6.4)
 - 详见 [`docs/项目说明.md`](docs/项目说明.md) §6 踩坑记录

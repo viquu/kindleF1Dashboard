@@ -1,0 +1,6 @@
+[Unit]
+Description=F1 Dashboard cloud renderer (fetch Jolpica, render screensaver PNG)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/f1dash/venv/bin/python /opt/f1dash/render.py

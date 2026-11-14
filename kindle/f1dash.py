@@ -3,16 +3,24 @@
 """F1 Dashboard for Kindle Paperwhite 1 (600x800 E-Ink).
 
 数据源:Jolpica F1(Ergast 兼容接口,https://api.jolpi.ca/ergast/f1/)
-字体:系统 /usr/java/lib/fonts/(只读 rootfs,直接引用)
+字体:系统 /usr/java/lib/fonts/(只读 rootfs,直接引用);云端/开发机走 fonts/ 后备
 
 用法:
-    f1dash.py png     拉数据 → Pillow 渲染 758x1024 → 写 linkss 屏保图片(默认)
-    f1dash.py service 守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新
+    f1dash.py png     拉数据 → Pillow 渲染 758x1024(开发预览;云端渲染同此函数)
+    f1dash.py pull    从云端下载渲染好的屏保图(CLOUD_URL),失败保留旧图
+    f1dash.py refresh 同 pull:只下载云端成图,云端不可达保留上一张屏保
+    f1dash.py service 守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新 + 可选一键回睡
+
+架构:渲染已上移到 Oracle 云端(systemd timer 出图 + nginx 静态服务),
+Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十秒压到几秒;
+云端不可达不做本机渲染,直接保留最后一张屏保图(渲染代码保留,供云端与开发预览复用)。
+一键回睡(auto_sleep 标志文件):信息牌模式下唤醒 → 刷新 → 模拟电源键
+自动入睡,锁屏永远显示最新图;想正常阅读时在 KUAL 菜单关闭开关。
 
 说明:本设备(PW1 5.6.1.1)的外部 RTC 闹钟无法从挂起唤醒内核
 (sysfs wakealarm 触发但无效,powerd rtcWakeup 不接受外部设置),
-故采用"唤醒即刷新"方案:设备休眠时守护进程冻结,唤醒后 3 秒内
-重新渲染屏保图;F1 数据变化不频繁,无需更实时。
+故设备休眠时守护进程冻结,无法在睡眠中刷新;F1 数据变化不频繁,
+云端出图 + 唤醒即拉已足够实时。
 """
 
 import calendar
@@ -35,6 +43,9 @@ API_BASE = "https://api.jolpi.ca/ergast/f1/"
 # 而是把 600×800 设计网格按 FULL_SCALE 等比放大到整个画布,仅留极细边距避免顶到面板边。
 SS_SIZE = (758, 1024)
 SS_OUT = "/mnt/us/linkss/screensavers/bg_ss00.png"
+# 超采样倍数:先在 4x 画布(3032x4096)渲染,再 LANCZOS 缩回 758x1024。
+# 云端 CPU 便宜,亚像素级线条/文字/字距全部平滑;设备不再渲染(纯 pull),无算力顾虑。
+AA_SCALE = 4
 DX, DY = 0, 0
 FULL_SCALE = 1.24
 FX = round((SS_SIZE[0] - 600 * FULL_SCALE) / 2)   # ≈7
@@ -42,30 +53,111 @@ FY = round((SS_SIZE[1] - 800 * FULL_SCALE) / 2)   # ≈16
 
 
 def fs(x):
-    """设计区 x 坐标 → 画布 x 坐标(等比放大 + 居中偏移)。"""
-    return round(x * FULL_SCALE + FX)
+    """设计区 x 坐标 → 画布 x 坐标(等比放大 + 居中偏移,× 超采样倍数)。"""
+    return round(x * FULL_SCALE * AA_SCALE + FX * AA_SCALE)
 
 
 def fy(y):
-    """设计区 y 坐标 → 画布 y 坐标(等比放大 + 居中偏移)。"""
-    return round(y * FULL_SCALE + FY)
+    """设计区 y 坐标 → 画布 y 坐标(等比放大 + 居中偏移,× 超采样倍数)。"""
+    return round(y * FULL_SCALE * AA_SCALE + FY * AA_SCALE)
 
 
 def fbox(x0, y0, x1, y1):
-    """设计区 box → 画布 box(传给 draw_track / draw_car / draw_track_fit)。"""
+    """设计区 box → 画布 box(传给 draw_track / draw_mark / draw_track_fit)。"""
     return (fs(x0), fy(y0), fs(x1), fy(y1))
+
+
+def lw(w):
+    """设计区线宽 → 超采样画布线宽(缩回后仍是 w 个物理像素,边缘经 AA 平滑)。"""
+    return max(1, round(w * AA_SCALE))
 
 FONT_BOLD = "/usr/java/lib/fonts/Futura-Bold.ttf"
 FONT_MED = "/usr/java/lib/fonts/Futura-Medium.ttf"
+# 云端/开发机字体目录(与 f1dash.py 同级的 fonts/):放 Futura 副本或 Jost 后备,
+# 见 _font_candidates()
+_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+# 仓库里的云端出图字体(cloud/fonts/,deploy.sh 同步到 /opt/f1dash/fonts/)
+_CLOUD_FONT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cloud", "fonts")
 
-TOP_DRIVERS = 8
-TOP_CONSTRUCTORS = 8
+TOP_DRIVERS = 10   # 计时塔行数(窄体字体 + 24px 行距放得下,积分付薪位全覆盖)
+TOP_CONSTRUCTORS = 10
 TOP_RESULTS = 5
 RACE_POSTER_WINDOW = 3 * 24 * 3600  # 距下一场开赛 <3 天(含比赛进行中)切赛事海报
 TRACKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracks.json")
-CAR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "car.json")
+ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "f1icon.json")
 
 SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+
+# ---------------- 云端成图(Oracle 渲染,Kindle 下载) ----------------
+
+CLOUD_URL = "http://149.118.42.190:8080/f1/latest.png"
+PULL_TIMEOUT = 25  # 下载成图(~100KB)的宽限秒数
+AUTO_SLEEP_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_sleep")
+
+
+def pull_screensaver(url=CLOUD_URL, out=SS_OUT):
+    """从云端下载渲染好的屏保图,原子替换;成功 True,失败保留旧图返回 False。
+
+    校验 PNG 魔数,防止错误页/半截响应覆盖屏保;与现图字节相同则跳过写盘。
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "f1dash-kindle"})
+        with urllib.request.urlopen(req, timeout=PULL_TIMEOUT) as resp:
+            data = resp.read()
+    except Exception as exc:
+        print("pull failed:", repr(exc)[:80])
+        return False
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        print("pull failed: not a PNG (%d bytes)" % len(data))
+        return False
+    try:
+        with open(out, "rb") as f:
+            if f.read() == data:
+                print("pull ok: unchanged")
+                return True
+    except Exception:
+        pass
+    tmp = out + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    except Exception as exc:
+        print("pull failed: write error", repr(exc)[:80])
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+    print("pull ok: %d bytes -> %s" % (len(data), out))
+    return True
+
+
+def refresh(out=SS_OUT):
+    """刷新屏保:下载云端成图(秒级);云端不可达保留上一张屏保图。
+
+    设备端不做本机渲染(渲染代码保留,供云端 render.py 与开发预览复用)。
+    返回 "pull" / None(拉图失败,保留上一张屏保)。
+    """
+    return "pull" if pull_screensaver(out=out) else None
+
+
+def maybe_autosleep(refreshed):
+    """信息牌一键回睡:开关标志存在且本次刷新成功时,模拟电源键入睡。
+
+    刷新失败(断网等)不回睡,留在清醒态方便排查;想正常阅读时在
+    KUAL 菜单把 Auto Sleep 切回 OFF。只在"唤醒触发的刷新"后调用,
+    清醒中的周期刷新不回睡。
+    """
+    if not refreshed or not os.path.exists(AUTO_SLEEP_FLAG):
+        return
+    try:
+        subprocess.run(["lipc-set-prop", "com.lab126.powerd", "powerButton", "1"],
+                       timeout=5)
+        log("auto sleep sent")
+    except Exception as exc:
+        log("auto sleep failed: %r" % exc)
 
 
 def fetch(path):
@@ -274,20 +366,40 @@ def get_track(circuit_id):
     return _tracks.get(circuit_id)
 
 
-_car = None
+_icon = None
 
 
-def get_car():
-    """赛车剪影闭合环数组(0-1000 网格)或 None;car.json 缺失/损坏时静默返回 None。"""
-    global _car
-    if _car is None:
+def get_icon():
+    """页眉头盔图标闭合环数组(0-1000 网格)或 None;f1icon.json 缺失/损坏时静默返回 None。
+
+    (MDI racing-helmet,见 tools/make_icon.py;早期是自绘赛车剪影 car.json)
+    """
+    global _icon
+    if _icon is None:
         try:
-            with open(CAR_FILE) as f:
+            with open(ICON_FILE) as f:
                 rings = json.load(f).get("rings")
-            _car = rings if isinstance(rings, list) else None
+            _icon = rings if isinstance(rings, list) else None
         except Exception:
-            _car = None
-    return _car
+            _icon = None
+    return _icon
+
+
+MARK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "f1logo.json")
+_mark = None
+
+
+def get_mark():
+    """F1 徽标闭合环数组(0-1000 网格,三个实心形状)或 None;缺失/损坏静默返回 None。"""
+    global _mark
+    if _mark is None:
+        try:
+            with open(MARK_FILE) as f:
+                rings = json.load(f).get("rings")
+            _mark = rings if isinstance(rings, list) else None
+        except Exception:
+            _mark = None
+    return _mark
 
 
 def get_dashboard_data():
@@ -348,8 +460,9 @@ def get_dashboard_data():
 #   0-44    页眉黑条(赛车剪影 + F1 DASHBOARD + 斜纹)
 #   66-262  HERO:左侧下一场大字比赛名,右侧赛道轮廓主角
 #   272-340 开赛时间反色板(LIGHTS OUT · UTC+8;屏保零刷新,不渲染倒计时)
-#   360-402 赛季刻度尺 + 双计时塔(车手/车队各 8 行,P1 行加粗)
-#   660-754 上场比赛领奖台 Top 3
+#   352-373 赛季进度刻度尺
+#   388-650 双计时塔(车手/车队各 10 行,P1 行加粗,其余行灰字标落后差距)
+#   664-752 上场比赛领奖台 Top 3
 #   768     页脚(LAST UPDATE)
 # 事件海报(距开赛 <3 天)与领奖台/结果块共用同一字体/灰度/标签语法。
 
@@ -364,7 +477,7 @@ def draw_track(d, box, pts):
     ox = DX + x0 + (w - 1000 * s) / 2
     oy = DY + y0 + (h - 1000 * s) / 2
     xy = [(ox + p[0] * s, oy + p[1] * s) for p in pts]
-    d.line(xy, fill=0, width=2, joint="curve")
+    d.line(xy, fill=0, width=lw(2), joint="curve")
 
 
 def draw_track_fit(d, box, pts, fill=0, width=3):
@@ -385,16 +498,16 @@ def draw_track_fit(d, box, pts, fill=0, width=3):
     ox = DX + x0 + (w - cw * s) / 2 - minx * s
     oy = DY + y0 + (h - ch * s) / 2 - miny * s
     d.line([(ox + p[0] * s, oy + p[1] * s) for p in pts],
-           fill=fill, width=width, joint="curve")
+           fill=fill, width=lw(width), joint="curve")
     return (ox, oy, s)
 
 
-def draw_car(d, box, rings, fill=0):
-    """赛车实心剪影:rings 为闭合环数组(0-1000 网格),box 为设计区坐标。
+def draw_mark(d, box, rings, fill=0):
+    """矢量标志实心渲染:rings 为闭合环数组(0-1000 网格),box 为设计区坐标。
 
-    按 rings 实际 bbox 等比装入 box(车高约 267/1000,不能按满格 1000 居中)。
-    逐环 polygon 填充而不是合并成一个多边形——Pillow 的填充规则在
-    嵌套子路径下会把轮子与车身重叠区挖成孔,分开填同色天然合并。
+    页眉头盔(f1icon.json)与官方徽标(f1logo.json)共用。按 rings 实际 bbox
+    等比装入 box;逐环 polygon 填充而不是合并成一个多边形——Pillow 的填充
+    规则在嵌套子路径下会把重叠区挖成孔,分开填同色天然合并。
     """
     x0, y0, x1, y1 = box
     w, h = x1 - x0, y1 - y0
@@ -410,6 +523,34 @@ def draw_car(d, box, rings, fill=0):
 
 
 GRAY_INK2, GRAY_LABEL, GRAY_SOFT, GRAY_FAINT = 90, 120, 170, 195
+
+
+def _leader_gap(leader, val):
+    """落后领先者的积分差;P1 行/无法计算(非数字积分)返回 ''。"""
+    try:
+        gap = int(float(leader)) - int(float(val))
+    except (TypeError, ValueError):
+        return ""
+    return "-%d" % gap if gap > 0 else ""
+
+
+def _font_candidates(bold):
+    """字体文件候选顺序:Barlow Semi Condensed(云端出图)→ Futura 副本 → Jost → 系统后备。
+
+    云端 /opt/f1dash/fonts/ 由 deploy.sh 放入 Barlow(另可选 sync_fonts.sh 加 Futura);
+    开发机从仓库 cloud/fonts/ 取;都缺则 Jost/系统字体兜底,版式经 _fit 自动适配。
+    """
+    barlow = "BarlowSemiCondensed-Bold.ttf" if bold else "BarlowSemiCondensed-Regular.ttf"
+    futura = "Futura-Bold.ttf" if bold else "Futura-Medium.ttf"
+    return [
+        os.path.join(_FONT_DIR, barlow),
+        os.path.join(_CLOUD_FONT_DIR, barlow),
+        FONT_BOLD if bold else FONT_MED,
+        os.path.join(_FONT_DIR, futura),
+        os.path.join(_FONT_DIR, "Jost.ttf"),
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans%s.ttf" % ("-Bold" if bold else ""),
+    ]
 
 
 def surname(full):
@@ -436,7 +577,7 @@ def short_date(iso):
 def _fit(d, font, s, max_w, start, bold=True, min_size=14):
     """动态缩字直到宽度 <= max_w(设计区坐标)。"""
     size = start
-    while size > min_size and d.textlength(s, font=font(bold, size)) / FULL_SCALE > max_w:
+    while size > min_size and d.textlength(s, font=font(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
         size -= 1
     return size
 
@@ -444,7 +585,7 @@ def _fit(d, font, s, max_w, start, bold=True, min_size=14):
 def _text_tracked(d, font, x, y, s, size, bold=False, fill=0, track=2, anchor="la"):
     """加字距小号大写标签;支持 la/ma/ra 三种水平锚。"""
     f = font(bold, size)
-    wd = sum(d.textlength(ch, font=f) for ch in s) / FULL_SCALE + track * len(s)
+    wd = sum(d.textlength(ch, font=f) for ch in s) / (FULL_SCALE * AA_SCALE) + track * len(s)
     if anchor[0] == "m":
         x -= wd / 2
     elif anchor[0] == "r":
@@ -452,19 +593,19 @@ def _text_tracked(d, font, x, y, s, size, bold=False, fill=0, track=2, anchor="l
     cx = fs(x)
     for ch in s:
         d.text((cx, fy(y)), ch, font=f, fill=fill)
-        cx += d.textlength(ch, font=f) + track * FULL_SCALE
+        cx += d.textlength(ch, font=f) + track * FULL_SCALE * AA_SCALE
 
 
 def _masthead(d, font, text):
-    """品牌页眉:黑条 + 赛车剪影 + F1 DASHBOARD + 斜纹(两版式共用)。"""
+    """品牌页眉:黑条 + 赛车剪影 + F1 DASHBOARD + F1 官方徽标(两版式共用)。"""
     d.rectangle([fs(0), fy(0), fs(600) - 1, fy(44)], fill=0)
-    car = get_car()
-    if car:
-        draw_car(d, fbox(8, 8, 138, 38), car, fill=255)
+    icon = get_icon()
+    if icon:
+        draw_mark(d, fbox(14, 8, 66, 38), icon, fill=255)
     text(300, 23, "F1 DASHBOARD", font(True, 21), fill=255, anchor="mm")
-    for x in (492, 508, 524):
-        d.line([fs(x), fy(34), fs(x + 15), fy(10)], fill=255, width=2)
-    text(578, 23, "F1", font(True, 17), fill=255, anchor="rm")
+    mark = get_mark()
+    if mark:
+        draw_mark(d, fbox(498, 11, 578, 34), mark, fill=255)
 
 
 def _season_ruler(d, x0, x1, y, done, total, tick_w=3.4, tick_h=9):
@@ -479,19 +620,25 @@ def _season_ruler(d, x0, x1, y, done, total, tick_w=3.4, tick_h=9):
 
 
 def _tower_block(d, font, text, x0, x1, label, rows, ty):
-    """计时塔区块:小标签 + 细线 + 8 行(P1 加粗,行下压细线)。"""
+    """计时塔区块:小标签 + 细线 + N 行(P1 加粗压细线,2 位起灰字标落后差距)。"""
     _text_tracked(d, font, x0, ty, label, 12, fill=GRAY_LABEL)
-    d.line([fs(x0), fy(ty + 20), fs(x1), fy(ty + 20)], fill=GRAY_SOFT, width=2)
+    d.line([fs(x0), fy(ty + 20), fs(x1), fy(ty + 20)], fill=GRAY_SOFT, width=lw(2))
     ry = ty + 34
+    leader = rows[0][2] if rows else None
     for i, (pos, name, val) in enumerate(rows):
         lead = pos == "1"
         text(x0, ry, pos, font(lead, 14), fill=0 if lead else GRAY_FAINT, anchor="lm")
         text(x0 + 24, ry, name, font(lead, 16), anchor="lm")
         text(x1, ry, str(val), font(True, 16), anchor="rm")
-        ry += 26
+        gap = _leader_gap(leader, val)
+        if gap:
+            # 差距列贴在积分左侧,宽度按积分实宽右对齐(窄体 3 位积分 ≈26 设计px)
+            pw = d.textlength(str(val), font=font(True, 16)) / (FULL_SCALE * AA_SCALE)
+            text(x1 - pw - 8, ry, gap, font(False, 12), fill=GRAY_LABEL, anchor="rm")
+        ry += 24
         if i == 0:
-            # 分隔线落在 26px 行距的中点,距上下两行文字各留 ~4px
-            d.line([fs(x0), fy(ry - 13), fs(x1), fy(ry - 13)], fill=GRAY_SOFT, width=1)
+            # 分隔线落在 24px 行距的中点,距上下两行文字各留 ~4px
+            d.line([fs(x0), fy(ry - 12), fs(x1), fy(ry - 12)], fill=GRAY_SOFT, width=lw(1))
 
 
 def _draw_dashboard(d, data, font, text):
@@ -524,12 +671,12 @@ def _draw_dashboard(d, data, font, text):
 
     # 赛季进度刻度尺
     done, total = data["progress"] or (0, 0)
-    _text_tracked(d, font, MARGIN, 360, "SEASON %s" % data["season"], 12, fill=GRAY_LABEL)
-    _season_ruler(d, MARGIN + 112, 486, 372, done, total)
-    text(RIGHT, 364, "%d/%d" % (done, total), font(True, 16), anchor="ra")
+    _text_tracked(d, font, MARGIN, 352, "SEASON %s" % data["season"], 12, fill=GRAY_LABEL)
+    _season_ruler(d, MARGIN + 112, 486, 364, done, total)
+    text(RIGHT, 356, "%d/%d" % (done, total), font(True, 16), anchor="ra")
 
     # 计时塔:车手 / 车队
-    ty = 408
+    ty = 388
     _tower_block(d, font, text, MARGIN, 290, "DRIVER STANDINGS",
                  [(p, surname(n), v) for p, n, v in data["standings"]], ty)
     _tower_block(d, font, text, 322, RIGHT, "CONSTRUCTOR STANDINGS",
@@ -538,19 +685,19 @@ def _draw_dashboard(d, data, font, text):
     # 上场比赛:领奖台 Top 3
     if data["last_race"]:
         last_place, _ = split_race_name(data["last_race"])
-        ly = 660
+        ly = 664
         _text_tracked(d, font, MARGIN, ly, "LAST RACE · %s" % last_place, 12, fill=GRAY_LABEL)
-        d.line([fs(MARGIN), fy(ly + 20), fs(RIGHT), fy(ly + 20)], fill=GRAY_SOFT, width=2)
+        d.line([fs(MARGIN), fy(ly + 20), fs(RIGHT), fy(ly + 20)], fill=GRAY_SOFT, width=lw(2))
         ry = ly + 34
         for pos, name, gap in data["last_results"][:3]:
             lead = pos == "1"
             text(MARGIN, ry, pos, font(lead, 14), fill=0 if lead else GRAY_FAINT, anchor="lm")
             text(MARGIN + 24, ry, surname(name), font(lead, 16), anchor="lm")
             text(RIGHT, ry, gap, font(lead, 15), fill=0 if lead else GRAY_INK2, anchor="rm")
-            ry += 26
+            ry += 22
 
     # 页脚
-    d.line([fs(MARGIN), fy(768), fs(RIGHT), fy(768)], fill=GRAY_SOFT, width=1)
+    d.line([fs(MARGIN), fy(768), fs(RIGHT), fy(768)], fill=GRAY_SOFT, width=lw(1))
     _text_tracked(d, font, MARGIN, 776, "LAST UPDATE %s" % data["upd"], 12,
                   fill=GRAY_LABEL, track=1)
 
@@ -562,7 +709,7 @@ def _poster_footer(d, data, font, text, nr):
                   15, fill=GRAY_INK2, track=2)
     _season_ruler(d, 400, 520, 701, done, total, tick_w=3, tick_h=8)
     text(572, 698, "%d/%d" % (done, total), font(False, 14), fill=GRAY_LABEL, anchor="ra")
-    d.line([fs(28), fy(768), fs(572), fy(768)], fill=GRAY_SOFT, width=1)
+    d.line([fs(28), fy(768), fs(572), fy(768)], fill=GRAY_SOFT, width=lw(1))
     _text_tracked(d, font, 28, 776, "LAST UPDATE %s" % data["upd"], 12,
                   fill=GRAY_LABEL, track=1)
 
@@ -580,7 +727,7 @@ def _draw_poster(d, data, font, text):
         return
 
     # ---- 无赛果:大海报版式 ----
-    d.rectangle([fs(0), fy(56), fs(600) - 1, fy(600)], fill=0)
+    d.rectangle([fs(0), fy(56), fs(600) - 1, fy(664)], fill=0)
     pts = get_track(nr["Circuit"]["circuitId"])
     if pts:
         draw_track_fit(d, fbox(120, 96, 480, 300), pts, fill=255, width=3)
@@ -593,6 +740,15 @@ def _draw_poster(d, data, font, text):
     day = format_race_daytime(nr)
     if day:
         text(300, 430, day, font(True, _fit(d, font, day, 530, 52)), fill=255, anchor="ma")
+    # 编辑感锚点:超大空心轮次数字(填充面板黑、白色描边),吃掉海报下半留白
+    # 垂直节奏(画布px):SUNDAY 底→标签 ~23,标签→数字顶 ~22,数字底→面板缘 ~46
+    # (两间隙均分是几何上限:数字顶固定后 SUNDAY 底到数字顶只余 ~55px);
+    # 标签锚 y(505)大于数字锚 y(489)是正常的——数字用 ma 锚,glyph 顶在锚下 ~46px
+    rnd = nr.get("round", "")
+    if rnd:
+        _text_tracked(d, font, 300, 497, "ROUND", 12, fill=140, anchor="ma", track=4)
+        text(300, 489, rnd, font(True, _fit(d, font, rnd, 420, 135)), fill=0,
+             anchor="ma", stroke_width=lw(3), stroke_fill=255)
     _poster_footer(d, data, font, text, nr)
 
 
@@ -616,7 +772,7 @@ def _draw_poster_results(d, data, font, text, nr):
     y = 300
     for b in data["poster_sessions"]:
         _text_tracked(d, font, 48, y, b["label"], 14, fill=255, track=3)
-        d.line([fs(48), fy(y + 24), fs(552), fy(y + 24)], fill=110, width=1)
+        d.line([fs(48), fy(y + 24), fs(552), fy(y + 24)], fill=110, width=lw(1))
         yy = y + 38
         for pos, name, val in b["rows"]:
             lead = pos == "1"
@@ -636,22 +792,29 @@ def png_render(data, out=SS_OUT):
         print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
         return False
 
-    img = Image.new("L", SS_SIZE, 255)
+    img = Image.new("L", (SS_SIZE[0] * AA_SCALE, SS_SIZE[1] * AA_SCALE), 255)
     d = ImageDraw.Draw(img)
 
     def font(bold, size):
-        # Kindle 用 Futura;开发机无此字体时退回 Helvetica/macOS 内置
-        # 字号按 FULL_SCALE 等比放大,保证真正铺满 758×1024 画布
-        for path in (FONT_BOLD if bold else FONT_MED,
-                     "/System/Library/Fonts/Helvetica.ttc"):
+        # 云端/开发机按 _font_candidates 顺序取字体(Barlow → Futura 副本 → Jost/系统后备)
+        # 字号按 FULL_SCALE × AA_SCALE 放大到超采样画布,保证缩回后铺满 758×1024
+        for path in _font_candidates(bold):
             try:
-                return ImageFont.truetype(path, max(1, round(size * FULL_SCALE)))
+                f = ImageFont.truetype(path, max(1, round(size * FULL_SCALE * AA_SCALE)))
             except Exception:
                 continue
+            if os.path.basename(path) == "Jost.ttf":
+                # Jost 是可变字体:按名称切到对应字重(失败则保持默认 Regular)
+                try:
+                    f.set_variation_by_name("Bold" if bold else "Medium")
+                except Exception:
+                    pass
+            return f
         return ImageFont.load_default()
 
-    def text(x, y, s, f, fill=0, anchor="la"):
-        d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor=anchor)
+    def text(x, y, s, f, fill=0, anchor="la", **kw):
+        # kw 透传 Pillow 原生参数(如 stroke_width/stroke_fill 描边字)
+        d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor=anchor, **kw)
 
     # 赛事周末(距下一场开赛 <3 天)切海报,否则默认仪表盘
     if race_poster_active(data):
@@ -659,6 +822,7 @@ def png_render(data, out=SS_OUT):
     else:
         _draw_dashboard(d, data, font, text)
 
+    img = img.resize(SS_SIZE, Image.LANCZOS)
     img.save(out)
     print("saved:", out, img.size, img.mode)
     return True
@@ -694,13 +858,14 @@ def service_mode():
     last_state = None
     last_refresh = 0.0
 
-    # 启动即刷新一次(确保屏保图是最新的)
+    # 启动即刷新一次(确保屏保图是最新的;启动路径不触发回睡)
     try:
-        if png_render(get_dashboard_data()):
+        ok = refresh()
+        if ok:
             last_refresh = time.time()
-            log("initial refresh done")
+            log("initial refresh done (%s)" % ok)
         else:
-            log("initial fetch failed; kept previous screensaver")
+            log("initial refresh failed; kept previous screensaver")
     except Exception as exc:
         log("initial refresh failed: %r" % exc)
 
@@ -713,23 +878,27 @@ def service_mode():
 
         if state in ("active", "ready"):
             if last_state not in ("active", "ready"):
-                # 刚唤醒:立即刷新
+                # 刚唤醒:立即刷新;信息牌开关开启且刷新成功则自动回睡
                 try:
-                    if png_render(get_dashboard_data()):
+                    ok = refresh()
+                    if ok:
                         last_refresh = now
-                        log("wake refresh done")
+                        log("wake refresh done (%s)" % ok)
                     else:
-                        log("wake fetch failed; kept previous screensaver")
+                        log("wake refresh failed; kept previous screensaver")
                 except Exception as exc:
+                    ok = None
                     log("wake refresh failed: %r" % exc)
+                maybe_autosleep(ok)
             elif now - last_refresh >= SERVICE_INTERVAL:
-                # 清醒中定期刷新
+                # 清醒中定期刷新(使用中,不回睡)
                 try:
-                    if png_render(get_dashboard_data()):
+                    ok = refresh()
+                    if ok:
                         last_refresh = now
-                        log("periodic refresh done")
+                        log("periodic refresh done (%s)" % ok)
                     else:
-                        log("periodic fetch failed; kept previous screensaver")
+                        log("periodic refresh failed; kept previous screensaver")
                 except Exception as exc:
                     log("periodic refresh failed: %r" % exc)
 
@@ -782,11 +951,13 @@ def mock_data(err=False, poster=False):
         "standings": [("1", "Kimi Antonelli", "219"), ("2", "Lewis Hamilton", "169"),
                       ("3", "Max Verstappen", "163"), ("4", "Lando Norris", "152"),
                       ("5", "Charles Leclerc", "131"), ("6", "George Russell", "122"),
-                      ("7", "Oscar Piastri", "118"), ("8", "Carlos Sainz", "104")],
+                      ("7", "Oscar Piastri", "118"), ("8", "Carlos Sainz", "104"),
+                      ("9", "Isack Hadjar", "71"), ("10", "Gabriel Bortoleto", "55")],
         "constructors": [("1", "Mercedes", "379"), ("2", "Ferrari", "307"),
                          ("3", "McLaren", "281"), ("4", "Red Bull", "242"),
                          ("5", "Aston Martin", "117"), ("6", "Williams", "48"),
-                         ("7", "Alpine", "42"), ("8", "Haas", "21")],
+                         ("7", "Alpine", "42"), ("8", "Haas", "21"),
+                         ("9", "Racing Bulls", "18"), ("10", "Audi", "12")],
         "last_results": [("1", "Lando Norris", "1:39:56.180"),
                          ("2", "Max Verstappen", "+15.080"),
                          ("3", "Oscar Piastri", "+18.362"),
@@ -809,6 +980,10 @@ def main():
     if mode == "service":
         service_mode()
         return 0
+    if mode == "pull":
+        return 0 if pull_screensaver(out=out) else 1
+    if mode == "refresh":
+        return 0 if refresh(out=out) else 1
     if "--mock" in argv:
         data = mock_data(err=False)
     elif "--mock-race" in argv:

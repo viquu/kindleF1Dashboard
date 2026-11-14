@@ -54,6 +54,37 @@ CIRCUITS = {
 TOKEN_RE = re.compile(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 
+def _arc_vals(tokens, i):
+    """读 A 命令 7 参数(rx ry rot laf sf x y),兼容标记与数字连写。
+
+    SVG 规范里 laf/sf 是单字符 0/1,允许省略分隔符(如 '011.5' = 0,1,1.5),
+    生成器优化过的 path 常见此写法;TOKEN_RE 会把它切成一个数字 token,
+    必须按字符拆回 laf/sf/x。返回 (rx, ry, rot, laf, sf, x, y, 下一个下标)。
+    """
+    rx, ry, rot = float(tokens[i]), float(tokens[i + 1]), float(tokens[i + 2])
+    j = i + 3
+    t = tokens[j]
+    if t[0] not in "01":
+        raise ValueError("bad arc flag token: %r" % t)
+    laf = int(t[0])
+    rest = t[1:]
+    if rest[:1] in ("0", "1"):
+        sf = int(rest[0])
+        rest = rest[1:]
+    else:
+        j += 1
+        sf = int(tokens[j])
+    if rest:
+        x = float(rest)
+        y = float(tokens[j + 1])
+        j += 1
+    else:
+        x = float(tokens[j + 1])
+        y = float(tokens[j + 2])
+        j += 2
+    return rx, ry, rot, laf, sf, x, y, j + 1
+
+
 def bez(pts, p0, c1, c2, p1, n=20):
     """三次贝塞尔采样 n 段追加到 pts(p0→p1,c1/c2 控制点)。"""
     for k in range(1, n + 1):
@@ -137,7 +168,7 @@ def parse_svg_path(d):
                 p1 = (x + p1[0], y + p1[1])
             pts.append(p1); x, y = p1  # 近似为直线
         elif cmd in "Aa":
-            rx, ry, rot, laf, sf, nx, ny = val(), val(), val(), val(), val(), val(), val()
+            rx, ry, rot, laf, sf, nx, ny, i = _arc_vals(tokens, i)
             if cmd == "a":
                 nx, ny = x + nx, y + ny
             pts.append((nx, ny)); x, y = nx, ny  # 弧线近似为直线终点
@@ -282,7 +313,7 @@ def parse_svg_paths(d):
                 p1 = (x + p1[0], y + p1[1])
             cur.append(p1); x, y = p1
         elif cmd in "Aa":
-            rx, ry, rot, laf, sf, nx, ny = val(), val(), val(), val(), val(), val(), val()
+            rx, ry, rot, laf, sf, nx, ny, i = _arc_vals(tokens, i)
             if cmd == "a":
                 nx, ny = x + nx, y + ny
             cur.extend(_arc_pts(x, y, nx, ny, rx, ry, rot, laf, sf))

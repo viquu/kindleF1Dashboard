@@ -1,0 +1,10 @@
+[Unit]
+Description=Run F1 Dashboard renderer every 10 minutes
+
+[Timer]
+# 赛事周末想更实时(如排位赛果出来就更新),临时改成 OnCalendar=*:* 即每分钟
+OnCalendar=*:0/10
+Persistent=true
+
+[Install]
+WantedBy=timers.target

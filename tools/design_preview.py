@@ -18,6 +18,8 @@ from PIL import Image, ImageDraw, ImageFont
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kindle"))
 import f1dash  # noqa: E402  (复用 mock 数据 / 赛道与赛车资产 / 坐标变换)
 
+f1dash.AA_SCALE = 1  # 草稿工具按 1x 渲染:本脚本自带 758x1024 画布,不做超采样
+
 # ---------------- 画布与设计网格(与 f1dash 相同:600x800 设计区 → 758x1024 画布) ----------------
 
 W, H = f1dash.SS_SIZE
@@ -106,9 +108,9 @@ class Ctx:
 def masthead(c):
     """品牌页眉:黑条 + 赛车剪影 + F1 字标 + 斜纹(两版式共用)。"""
     c.d.rectangle([c.X(0), c.Y(0), c.X(600) - 1, c.Y(MASTHEAD_H)], fill=BLACK)
-    car = f1dash.get_car()
-    if car:
-        f1dash.draw_car(c.d, f1dash.fbox(8, 8, 138, 38), car, fill=WHITE)
+    icon = f1dash.get_icon()
+    if icon:
+        f1dash.draw_mark(c.d, f1dash.fbox(8, 8, 138, 38), icon, fill=WHITE)
     c.text(300, MASTHEAD_H / 2 + 1, "F1 DASHBOARD", 21, bold=True, fill=WHITE, anchor="mm")
     for x in (492, 508, 524):
         c.d.line([c.X(x), c.Y(34), c.X(x + 15), c.Y(10)], fill=WHITE, width=2)

@@ -12,8 +12,8 @@ if [ -n "$OLDPID" ] && [ -d "/proc/$OLDPID" ] && \
 fi
 rm -f "$PIDFILE"
 
-# 立即生成一次屏保图
-/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py png
+# 立即刷新一次屏保图(下载云端成图;失败保留上一张)
+/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py refresh
 
 # 后台守护进程(设备无 nohup/setsid;KUAL 从 GUI 启动即可常驻,
 # 从 SSH 启动需先 python 双 fork 脱离会话,否则断开会话时被 SIGHUP 带走)
