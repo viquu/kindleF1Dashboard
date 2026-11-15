@@ -10,7 +10,7 @@
     f1dash.py pull      从云端下载渲染好的屏保图(CLOUD_URL),失败保留旧图
     f1dash.py refresh   同 pull:只下载云端成图,云端不可达保留上一张屏保
     f1dash.py service   守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新 + 可选一键回睡
-    f1dash.py alwayson  常显守护:永不入睡,每小时开 Wi-Fi 拉图 eips 全屏显示后关 Wi-Fi
+    f1dash.py alwayson  常显守护:永不入睡,每小时拉图 → 叠加电量角标 → eips 全屏显示
     f1dash.py battreport  汇总常显期间电池采样 CSV,实测电流外推整块电池续航
 
 架构:渲染已上移到 Oracle 云端(systemd timer 出图 + nginx 静态服务),
@@ -18,8 +18,11 @@ Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十�
 云端不可达不做本机渲染,直接保留最后一张屏保图(渲染代码保留,供云端与开发预览复用)。
 一键回睡(auto_sleep 标志文件):信息牌模式下唤醒 → 刷新 → 模拟电源键
 自动入睡,锁屏永远显示最新图;想正常阅读时在 KUAL 菜单关闭开关。
-常显模式(alwayson):设备永不入睡,每小时开 Wi-Fi 拉图 eips 全屏显示后关
-Wi-Fi;RTC 无法从挂起唤醒(见下),常显就是用续航换全天候实时。
+常显模式(alwayson):设备永不入睡,每小时拉云端图 eips 全屏重显示;RTC 无法
+从挂起唤醒(见下),常显就是用续航换全天候实时。Wi-Fi 常开不关(2026-11-15
+用户决策:实测 wifid 软关无效、硬关有把拉图链路搞挂的风险,代价 ~30-60 mAh/h)。
+framework 停了屏上看不到状态栏电量,拉图后本地把电量角标(电池图标+百分比+
+实测外推续航,低电加顶部警告条)叠进底部白边,不必 SSH 就知道还能撑多久。
 
 说明:本设备(PW1 5.6.1.1)的外部 RTC 闹钟无法从挂起唤醒内核
 (sysfs wakealarm 触发但无效,powerd rtcWakeup 不接受外部设置),
@@ -1162,8 +1165,10 @@ def service_mode():
 # 前置光始终关闭 —— 常显模式下它是最大的单一耗电源。
 # 循环内每轮重申防入睡标志并重试熄灯,防框架重置。
 
-ALWAYS_OUT = "/mnt/us/f1dash/latest.png"   # eips 全屏显示用成图
+ALWAYS_OUT = "/mnt/us/f1dash/latest.png"   # eips 全屏显示用成图(SS_OUT + 电量角标)
 ALWAYS_INTERVAL = 3600                     # 常显刷新周期(秒)
+BADGE_STRIP_H = 26                         # 底部白边高度(画布物理像素,角标所在)
+LOW_BATT_PCT = 15                          # 电量不高于此值时顶部加黑底警告条
 BATT_SYSFS = "/sys/devices/system/yoshi_battery/yoshi_battery0"
 BATT_LOG = "/mnt/us/f1dash/battery.csv"    # 电池采样 CSV(battreport 消费)
 BATT_SAMPLE = 60                           # 采样周期:电芯计量更新缓慢,秒级无意义
@@ -1214,6 +1219,17 @@ def front_light_off():
         log("front light off failed: %r" % exc)
 
 
+def is_charging():
+    """powerd isCharging(1=充电中);查询失败按未充电处理。BatteryMeter 与电量角标共用。"""
+    try:
+        out = subprocess.run(["lipc-get-prop", "com.lab126.powerd",
+                              "isCharging"], capture_output=True, text=True,
+                             timeout=5)
+        return out.stdout.strip() == "1"
+    except Exception:
+        return False
+
+
 def framework_pids():
     """GUI 框架/状态栏渲染进程 pid 列表(cmdline 含 framework 或 pillowd)。
 
@@ -1246,6 +1262,8 @@ def framework_stop():
         try:
             r = subprocess.run(["/sbin/stop", job], capture_output=True, timeout=15)
             if r.returncode != 0:
+                if b"Unknown instance" in (r.stderr or b""):
+                    continue   # 本来就没在跑,正是想要的状态,不算失败
                 log("stop %s: %s" % (job, (r.stderr or r.stdout)[:60]))
                 ok = False
         except Exception as exc:
@@ -1262,26 +1280,36 @@ def framework_ensure_stopped():
     return False
 
 
-def wifi(on):
-    """Wi-Fi 开关:直接指挥 wifid(独立守护,framework 生死都可用)。
+WLAN_IF = "wlan0"                  # PW1 无线接口(/proc/net/route 实测)
+IFCONFIG = "/sbin/ifconfig"
 
-    com.lab126.cmd wirelessEnable 是 UI 层开关,由 framework 进程提供:
-    框架活着时一调就弹飞行模式对话框盖屏,框架死了则无人响应——常显模式
-    两个都不能要。wifid enable 实测框架生死均可关联(见 wifitest 记录)。
-    cmd 仅作 wifid 调用异常时的后备(需框架活着)。
+
+def wifi(on):
+    """Wi-Fi 开关:指挥 wifid(独立守护,framework 生死都可用)。
+
+    wirelessEnable(cmd)是 framework 提供的 UI 层开关(会弹框/无人响应),不能用;
+    enable 1 关联+拉图实测可用。enable 0 实测并不拆除关联——wifid 会把属性翻回
+    1 并 ~15s 内自动重连,软关形同虚设;真要省电须停 wifid job 本体(未上线,
+    2026-11-15 用户决策:常显 Wi-Fi 常开不关,避免硬关影响拉图链路)。故 off
+    分支为空操作,on 保留自愈语义(接口 up + enable 1,断网后每轮自动恢复)。
     """
-    val = "1" if on else "0"
+    if not on:
+        return False
     try:
-        subprocess.run(["lipc-set-prop", "com.lab126.wifid", "enable", val],
+        subprocess.run([IFCONFIG, WLAN_IF, "up"], capture_output=True, timeout=5)
+    except Exception as exc:
+        log("ifconfig up failed: %r" % exc)
+    try:
+        subprocess.run(["lipc-set-prop", "com.lab126.wifid", "enable", "1"],
                        capture_output=True, timeout=5)
         return True
     except Exception as exc:
-        log("wifid enable(%s) failed: %r" % (on, exc))
+        log("wifid enable(1) failed: %r" % exc)
         try:
             subprocess.run(["lipc-set-prop", "com.lab126.cmd",
-                            "wirelessEnable", val], capture_output=True, timeout=5)
+                            "wirelessEnable", "1"], capture_output=True, timeout=5)
         except Exception as exc2:
-            log("cmd wirelessEnable(%s) failed: %r" % (on, exc2))
+            log("cmd wirelessEnable(1) failed: %r" % exc2)
         return False
 
 
@@ -1320,23 +1348,111 @@ def show_fullscreen(path=ALWAYS_OUT):
         log("show failed: %r" % exc)
 
 
-def always_cycle():
-    """一轮常显刷新:开 Wi-Fi → 拉图(显示图+锁屏图)→ 全屏显示 → 关 Wi-Fi。
+def _fmt_days(days):
+    """续航估计(天)→ '~11d' / '~5.3d' / '~14h';None 返回 ''。"""
+    if days is None:
+        return ""
+    if days >= 10:
+        return "~%dd" % round(days)
+    if days >= 1:
+        return "~%.1fd" % days
+    return "~%.0fh" % (days * 24.0)
 
-    无网络或拉图失败都保留上一张图并照样重显示,屏面始终有内容。
+
+def _badge_font(size_px):
+    """角标字体:物理像素字号(角标直接画画布坐标,不乘 FULL_SCALE);候选同 _font_candidates。"""
+    for path in _font_candidates(True):
+        try:
+            return ImageFont.truetype(path, size_px)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def overlay_battery(src=SS_OUT, dst=ALWAYS_OUT, status=None):
+    """把电量角标叠加到干净成图副本并原子写 dst:底部白边画电池图标 + 百分比 +
+    实测外推续航,电量 <=LOW_BATT_PCT 另加顶部黑底警告条。
+
+    干净源 src 恒为云端原图,叠加每轮从 src 重做,角标电量/续航始终是当刻值
+    (拉图失败也一样)。局部 4x 超采样再 LANCZOS 缩回,平滑度与云端成图一致。
+    status 供开发机预览注入假数据;读不到电量(sysfs 缺失)时不画角标返回 False。
+    """
+    try:
+        st = status if status is not None else battery_status()
+        if not st or st.get("pct") is None:
+            return False
+        img = Image.open(src).convert("L")
+        W, H = img.size
+        p = AA_SCALE
+
+        # 底部角标条(白边内右对齐):电池图标(按百分比填充) + "83% CHG  ~11d"
+        strip = BADGE_STRIP_H
+        patch = Image.new("L", (W * p, strip * p), 255)
+        pd = ImageDraw.Draw(patch)
+        s = "%d%%" % st["pct"]
+        if st.get("charging"):
+            s += " CHG"
+        days = _fmt_days(st.get("days"))
+        if days:
+            s += "  " + days
+        f = _badge_font(15 * p)
+        x_right = W * p - 10 * p
+        pd.text((x_right, strip * p // 2), s, font=f, fill=0, anchor="rm")
+        tw = pd.textlength(s, font=f)
+        bh = 12 * p
+        bw = 22 * p
+        by = (strip * p - bh) // 2
+        bx = x_right - tw - 6 * p - bw - 4 * p   # 身体左缘:文字左缘 - 间隙 - 凸头 - 身宽
+        pd.rectangle([bx, by, bx + bw, by + bh], outline=0, width=p)
+        pd.rectangle([bx + bw + 2 * p, by + bh // 2 - 2 * p,
+                      bx + bw + 4 * p, by + bh // 2 + 2 * p], fill=0)
+        fw = max(p, round((bw - 4 * p) * max(0, min(100, st["pct"])) / 100.0))
+        pd.rectangle([bx + 2 * p, by + 2 * p, bx + 2 * p + fw, by + bh - 2 * p], fill=0)
+        img.paste(patch.resize((W, strip), Image.LANCZOS), (0, H - strip))
+
+        # 低电量警告条:黑底白字盖住页眉顶部,醒目优先于完整性
+        if st["pct"] <= LOW_BATT_PCT:
+            bh2 = 34
+            bpatch = Image.new("L", (W * p, bh2 * p), 0)
+            bd = ImageDraw.Draw(bpatch)
+            bd.text((W * p // 2, bh2 * p // 2),
+                    "LOW BATTERY %d%% - CONNECT CHARGER" % st["pct"],
+                    font=_badge_font(16 * p), fill=255, anchor="mm")
+            img.paste(bpatch.resize((W, bh2), Image.LANCZOS), (0, 0))
+
+        tmp = dst + ".tmp"
+        img.save(tmp, format="PNG")   # tmp 后缀无扩展名,须显式指定格式
+        os.replace(tmp, dst)
+        return True
+    except Exception as exc:
+        log("battery overlay failed: %r" % exc)
+        return False
+
+
+def always_cycle():
+    """一轮常显刷新:确保 Wi-Fi → 拉图 → 叠加电量角标 → 全屏显示。
+
+    云端原图只进 SS_OUT(锁屏图保持干净,framework 活着时状态栏自有电量),
+    eips 显示图由 overlay_battery 从 SS_OUT 现算:即使拉图失败,角标上的
+    电量/续航也随每轮更新。无干净源时兜底显示旧显示图,屏面始终有内容。
     """
     t0 = time.time()
     wifi(True)
     net = wait_network()
     pulled = False
     if net:
-        pulled = pull_image(outs=(ALWAYS_OUT, SS_OUT))
+        pulled = pull_image(outs=(SS_OUT,))
         if not pulled:
             log("cycle: pull failed; keep last image")
     else:
         log("cycle: no network; keep last image")
-    if os.path.exists(ALWAYS_OUT):
-        show_fullscreen()
+    shown = None
+    if os.path.exists(SS_OUT):
+        shown = ALWAYS_OUT if overlay_battery() else SS_OUT
+    elif os.path.exists(ALWAYS_OUT):
+        shown = ALWAYS_OUT
+    if shown:
+        show_fullscreen(shown)
     wifi(False)
     cap = _sysfs_raw("battery_capacity") or "?"
     log("cycle done in %ds: net=%s pull=%s battery %s"
@@ -1413,15 +1529,6 @@ class BatteryMeter(threading.Thread):
         self.sample = sample
         self._stop = threading.Event()
 
-    def _charging(self):
-        try:
-            out = subprocess.run(["lipc-get-prop", "com.lab126.powerd",
-                                  "isCharging"], capture_output=True, text=True,
-                                 timeout=5)
-            return out.stdout.strip() == "1"
-        except Exception:
-            return False
-
     def run(self):
         if not os.path.isdir(BATT_SYSFS):
             log("battery meter disabled: no %s" % BATT_SYSFS)
@@ -1448,7 +1555,7 @@ class BatteryMeter(threading.Thread):
                 _sysfs_raw("battery_lmd"), _sysfs_raw("battery_voltage"),
                 _sysfs_raw("battery_current"),
                 _sysfs_raw("battery_temperature"),
-                1 if self._charging() else 0)
+                1 if is_charging() else 0)
             try:
                 with open(self.path, "a") as f:
                     f.write(line)
@@ -1456,11 +1563,11 @@ class BatteryMeter(threading.Thread):
                 pass
 
 
-def battreport(path=BATT_LOG):
-    """汇总电池采样 CSV:放电速率、平均功率、外推续航,并检测入睡空洞。
+def batt_rows(path=BATT_LOG):
+    """读电池采样 CSV → (rows, restarts);rows 按时间升序,表头/坏行跳过。
 
-    放电速率用 battery_mAH 随时间衰减计算(不依赖电流原始单位,插电行剔除);
-    行间空洞 >5 分钟视为发生过挂起(常显模式不该出现),显式列出。
+    `# restart <ts>` 是 BatteryMeter 进程重启标记(区分采样空洞是重启还是
+    挂起);battreport(完整报表)与 battery_status(角标续航)共用本解析。
     """
     rows, restarts = [], []
     try:
@@ -1487,10 +1594,53 @@ def battreport(path=BATT_LOG):
                                  "chg": p[8] == "1"})
                 except ValueError:
                     continue
-    except Exception as exc:
-        print("no battery log: %r" % exc)
-        return 1
+    except Exception:
+        return [], []
     rows.sort(key=lambda r: r["ts"])
+    return rows, restarts
+
+
+def battery_status(win_h=24):
+    """当前电量快照:sysfs 荷电 + BATT_LOG 实测放电速率外推续航(电量角标用)。
+
+    pct/mAh 读 yoshi sysfs 当前真值;续航 = 剩余 mAh ÷ 当前守护进程运行段的
+    非充电样本 ΔmAh/Δt(与 battreport 同口径)。只用最后一条 # restart 之后
+    的样本:模式切换(测试期/信息牌/常显)必经守护重启,跨段速率口径不一致
+    ——framework 活着时的高耗电样本混入会把续航估得离谱。样本不足(<2 行/
+    段内 <1h)或速率测不出(gauge 分辨率以下)时 days=None,角标只显示百分比。
+    sysfs 缺失(非设备环境)返回 None,调用方跳过角标。
+    """
+    try:
+        pct = int(_sysfs_raw("battery_capacity").rstrip("%"))
+    except ValueError:
+        return None
+    try:
+        mah = float(_sysfs_raw("battery_mAH") or 0)
+    except ValueError:
+        mah = 0.0
+    rows, restarts = batt_rows(BATT_LOG)
+    now = time.time()
+    seg_start = max(now - win_h * 3600, restarts[-1] if restarts else 0.0)
+    disch = [r for r in rows if not r["chg"] and r["ts"] >= seg_start]
+    days = None
+    if len(disch) >= 2:
+        span_h = (disch[-1]["ts"] - disch[0]["ts"]) / 3600.0
+        used = disch[0]["mah"] - disch[-1]["mah"]
+        if span_h >= 1 and used > 0:
+            days = disch[-1]["mah"] / (used / span_h) / 24.0
+    return {"pct": pct, "mah": mah, "days": days, "charging": is_charging()}
+
+
+def battreport(path=BATT_LOG):
+    """汇总电池采样 CSV:放电速率、平均功率、外推续航,并检测入睡空洞。
+
+    放电速率用 battery_mAH 随时间衰减计算(不依赖电流原始单位,插电行剔除);
+    行间空洞 >5 分钟视为发生过挂起(常显模式不该出现),显式列出。
+    """
+    rows, restarts = batt_rows(path)
+    if not rows:
+        print("no battery log: %s" % path)
+        return 1
     if len(rows) < 2:
         print("not enough samples yet (%d rows)" % len(rows))
         return 1

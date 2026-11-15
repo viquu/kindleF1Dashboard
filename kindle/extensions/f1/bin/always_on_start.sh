@@ -5,10 +5,11 @@
 # 用法: always_on_start.sh [刷新间隔秒]  (缺省 3600;传 180 之类短周期便于测试)
 PIDFILE=/var/run/f1dash_alwayson.pid
 
-# 已在运行则跳过(校验 pid 确实是 alwayson:pid 会被系统回收,裸 kill -0 会误判)
+# 已在运行则跳过(校验 pid 确实是 alwayson:pid 会被系统回收,裸 kill -0 会误判;
+# cmdline argv 以 NUL 分隔,须先 tr 转空格,直接 grep 带空格的 pattern 永远不匹配)
 OLDPID=$(cat "$PIDFILE" 2>/dev/null)
 if [ -n "$OLDPID" ] && [ -d "/proc/$OLDPID" ] && \
-   grep -q "f1dash.py alwayson" "/proc/$OLDPID/cmdline" 2>/dev/null; then
+   tr "\0" " " < "/proc/$OLDPID/cmdline" 2>/dev/null | grep -q "f1dash.py alwayson"; then
     echo "f1dash alwayson already running"
     exit 0
 fi

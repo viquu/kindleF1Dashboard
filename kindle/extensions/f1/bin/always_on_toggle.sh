@@ -6,8 +6,10 @@ MENU=/mnt/us/extensions/f1/menu.json
 
 RUNNING=0
 OLDPID=$(cat "$PIDFILE" 2>/dev/null)
+# cmdline 里 argv 以 NUL 分隔,"f1dash.py alwayson" 字面量不存在于原始字节,
+# 直接 grep 永远不匹配(曾导致 toggle 双开守护);先 tr 转空格再匹配
 if [ -n "$OLDPID" ] && [ -d "/proc/$OLDPID" ] && \
-   grep -q "f1dash.py alwayson" "/proc/$OLDPID/cmdline" 2>/dev/null; then
+   tr "\0" " " < "/proc/$OLDPID/cmdline" 2>/dev/null | grep -q "f1dash.py alwayson"; then
     RUNNING=1
 fi
 

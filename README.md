@@ -37,7 +37,7 @@ F1 数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,�
 
 - **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后自动下载云端成图(秒级)
 - **一键回睡(Auto Sleep)**:信息牌模式下按一下电源键 → Kindle 秒级拉取新图 → 自动回睡,锁屏永远是最新的;想正常阅读时在 KUAL 菜单切回 OFF
-- **常显模式(Always On)**:设备永不入睡,每小时开 Wi-Fi → 下载云端成图 → eips 全屏显示 → 关 Wi-Fi,前置光强制关闭;与"信息牌+一键回睡"互补,是全天候实时版,代价是续航(内置电池计量,`battreport` 外推)
+- **常显模式(Always On)**:设备永不入睡,每小时拉云端成图 eips 全屏重显示,前置光强制关闭;与"信息牌+一键回睡"互补,是全天候实时版。Wi-Fi 常开不关(实测软关无效、硬关有断图风险),代价 ~30-60 mAh/h、基本一天一充(内置电池计量,`battreport` 外推)。拉图后本地把电量角标(电池图标 + 百分比 + 实测外推续航,≤15% 加顶部警告条)叠进右下角白边——framework 停了没有状态栏电量,屏上直接看还能撑多久
 - **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字开赛时刻,替代日常信息密集的仪表盘;周末里排位赛/冲刺赛结束后**渐进**补出对应赛果(Top 5),正赛前信息更有用;赛程剩余 >3 天时自动回到仪表盘
 - **屏保内容(仪表盘)**:大字标题条(左上角小牌显示更新时刻,北京时间)、车手/车队积分榜 Top 5(点线引导)、下一场比赛面板(赛名、轮次、反色开赛时刻条、赛道轮廓图)、上场比赛领奖台 Top 3、底部资讯盒三联(杭州每日天气 / 巴萨下一场 LaLiga + 榜位 / GitHub Trending 今日第一仓)
 - **刷新屏保**:KUAL 里一键 Refresh Now(下载云端成图,秒级)
@@ -94,7 +94,7 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 |---|---|
 | 当信息牌摆着 | KUAL → **Start Service** → **Auto Sleep 切到 ON** → 按电源键休眠,屏保显示面板;之后按一下电源键,它自己拉新图并回睡,锁屏始终最新 |
 | 全天候信息牌 | KUAL → **Always On 切到 ON**:设备自动停掉 framework + pillow(纯净全屏,无状态栏/对话框),每小时开 Wi-Fi(wifid)拉图 eips 全屏重显示后关 Wi-Fi;**运行中 KUAL 不可用**,恢复阅读跑 `ssh kindle /mnt/us/extensions/f1/bin/always_on_stop.sh`(自动拉回 framework+pillow)或直接重启 Kindle |
-| 看常显续航 | 设备在线时 `ssh kindle "/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py battreport"`(采样 CSV 在 `/mnt/us/f1dash/battery.csv`;每小时刷新的 Wi-Fi 窗口内可连) |
+| 看电量/续航 | 常显屏右下角角标(每小时随刷新更新,含实测外推续航);想看完整报表再 `ssh kindle "/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py battreport"`(采样 CSV 在 `/mnt/us/f1dash/battery.csv`;每小时刷新的 Wi-Fi 窗口内可连) |
 | 正常阅读 | KUAL → **Auto Sleep 切到 OFF**,唤醒后不再自动回睡 |
 | 立即刷新屏保 | KUAL → **Refresh Now**(优先拉云端成图,下次休眠显示新图) |
 | 停用服务 | KUAL → **Stop Service** |
