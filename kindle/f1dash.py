@@ -6,16 +6,20 @@
 字体:系统 /usr/java/lib/fonts/(只读 rootfs,直接引用);云端/开发机走 fonts/ 后备
 
 用法:
-    f1dash.py png     拉数据 → Pillow 渲染 758x1024(开发预览;云端渲染同此函数)
-    f1dash.py pull    从云端下载渲染好的屏保图(CLOUD_URL),失败保留旧图
-    f1dash.py refresh 同 pull:只下载云端成图,云端不可达保留上一张屏保
-    f1dash.py service 守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新 + 可选一键回睡
+    f1dash.py png       拉数据 → Pillow 渲染 758x1024(开发预览;云端渲染同此函数)
+    f1dash.py pull      从云端下载渲染好的屏保图(CLOUD_URL),失败保留旧图
+    f1dash.py refresh   同 pull:只下载云端成图,云端不可达保留上一张屏保
+    f1dash.py service   守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新 + 可选一键回睡
+    f1dash.py alwayson  常显守护:永不入睡,每小时开 Wi-Fi 拉图 eips 全屏显示后关 Wi-Fi
+    f1dash.py battreport  汇总常显期间电池采样 CSV,实测电流外推整块电池续航
 
 架构:渲染已上移到 Oracle 云端(systemd timer 出图 + nginx 静态服务),
 Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十秒压到几秒;
 云端不可达不做本机渲染,直接保留最后一张屏保图(渲染代码保留,供云端与开发预览复用)。
 一键回睡(auto_sleep 标志文件):信息牌模式下唤醒 → 刷新 → 模拟电源键
 自动入睡,锁屏永远显示最新图;想正常阅读时在 KUAL 菜单关闭开关。
+常显模式(alwayson):设备永不入睡,每小时开 Wi-Fi 拉图 eips 全屏显示后关
+Wi-Fi;RTC 无法从挂起唤醒(见下),常显就是用续航换全天候实时。
 
 说明:本设备(PW1 5.6.1.1)的外部 RTC 闹钟无法从挂起唤醒内核
 (sysfs wakealarm 触发但无效,powerd rtcWakeup 不接受外部设置),
@@ -26,10 +30,13 @@ Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十�
 import calendar
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 import urllib.request
 
 import certifi
@@ -96,10 +103,11 @@ PULL_TIMEOUT = 25  # 下载成图(~100KB)的宽限秒数
 AUTO_SLEEP_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_sleep")
 
 
-def pull_screensaver(url=CLOUD_URL, out=SS_OUT):
-    """从云端下载渲染好的屏保图,原子替换;成功 True,失败保留旧图返回 False。
+def pull_image(url=CLOUD_URL, outs=(SS_OUT,)):
+    """从云端下载渲染好的图,原子替换写入每个目标;成功 True,失败保留旧图返回 False。
 
-    校验 PNG 魔数,防止错误页/半截响应覆盖屏保;与现图字节相同则跳过写盘。
+    校验 PNG 魔数,防止错误页/半截响应覆盖;与已有文件字节相同则跳过写盘。
+    常显模式一次下载同时更新 eips 显示图与 linkss 锁屏图。
     """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "f1dash-kindle"})
@@ -111,27 +119,37 @@ def pull_screensaver(url=CLOUD_URL, out=SS_OUT):
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         print("pull failed: not a PNG (%d bytes)" % len(data))
         return False
-    try:
-        with open(out, "rb") as f:
-            if f.read() == data:
-                print("pull ok: unchanged")
-                return True
-    except Exception:
-        pass
-    tmp = out + ".tmp"
-    try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, out)
-    except Exception as exc:
-        print("pull failed: write error", repr(exc)[:80])
+    written = 0
+    for out in outs:
         try:
-            os.remove(tmp)
+            with open(out, "rb") as f:
+                if f.read() == data:
+                    continue
         except Exception:
             pass
-        return False
-    print("pull ok: %d bytes -> %s" % (len(data), out))
+        tmp = out + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, out)
+            written += 1
+        except Exception as exc:
+            print("pull failed: write error %s %r" % (out, repr(exc)[:60]))
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return False
+    if written:
+        print("pull ok: %d bytes -> %s" % (len(data), ",".join(outs)))
+    else:
+        print("pull ok: unchanged")
     return True
+
+
+def pull_screensaver(url=CLOUD_URL, out=SS_OUT):
+    """从云端下载渲染好的屏保图(单目标,见 pull_image);失败保留旧图返回 False。"""
+    return pull_image(url=url, outs=(out,))
 
 
 def refresh(out=SS_OUT):
@@ -160,9 +178,15 @@ def maybe_autosleep(refreshed):
         log("auto sleep failed: %r" % exc)
 
 
-def fetch(path):
-    with urllib.request.urlopen(API_BASE + path, timeout=30, context=SSL_CTX) as resp:
+def fetch_json(url, timeout=12):
+    """通用 JSON GET(侧栏数据源共用);失败抛异常,由调用方按块兜底。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "f1dash/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
         return json.load(resp)
+
+
+def fetch(path):
+    return fetch_json(API_BASE + path, timeout=30)
 
 
 def find_next_race(races):
@@ -402,14 +426,149 @@ def get_mark():
     return _mark
 
 
+# ---------------- 侧栏数据源(天气 / 巴萨赛程 / GitHub Trending) ----------------
+# 仪表盘底部三个资讯盒各配一个免费免 Key 数据源,独立容错:
+# 任一失败只留空自己的盒子,不拖垮 F1 主面板。
+
+WEATHER_CITY = {"name": "HANGZHOU", "lat": 30.25, "lon": 120.17, "tz": "Asia/Shanghai"}
+BARCA_TEAM_ID = 83      # ESPN soccer 里的 FC Barcelona
+BARCA_LEAGUE = "esp.1"  # LaLiga
+TRENDING_URL = "https://github.com/trending"
+
+# WMO 天气码 → 短语(open-meteo daily.weather_code)
+WMO_TEXT = {0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy",
+            45: "Fog", 48: "Fog",
+            51: "Drizzle", 53: "Drizzle", 55: "Drizzle",
+            56: "Icy drizzle", 57: "Icy drizzle",
+            61: "Light rain", 63: "Rain", 65: "Heavy rain",
+            66: "Icy rain", 67: "Icy rain",
+            71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow",
+            80: "Showers", 81: "Showers", 82: "Heavy showers",
+            85: "Snow showers", 86: "Snow showers",
+            95: "Thunderstorm", 96: "Storms", 99: "Storms"}
+
+
+def get_weather():
+    """Hangzhou 每日预报(当日高低温/天气/降水概率 + 明日概要),Open-Meteo。
+
+    只取 daily 日值,不取 current——屏保一挂一整天,当前气温几分钟后就失真。
+    """
+    q = WEATHER_CITY
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+           "&daily=temperature_2m_max,temperature_2m_min,weather_code,"
+           "precipitation_probability_max&timezone=%s&forecast_days=2"
+           % (q["lat"], q["lon"], urllib.parse.quote(q["tz"])))
+    daily = fetch_json(url)["daily"]
+
+    def day(i):
+        return {"high": round(daily["temperature_2m_max"][i]),
+                "low": round(daily["temperature_2m_min"][i]),
+                "text": WMO_TEXT.get(int(daily["weather_code"][i]), "—"),
+                "pop": int(daily["precipitation_probability_max"][i] or 0)}
+
+    return {"city": q["name"], "today": day(0), "tomorrow": day(1)}
+
+
+def _laliga_season():
+    """LaLiga 赛季年(ESPN 口径):8 月开踢跨年,6 月起算当年。"""
+    now = time.gmtime()
+    return now.tm_year if now.tm_mon >= 6 else now.tm_year - 1
+
+
+def _espn_barca_entry(standings):
+    """在 ESPN standings 嵌套结构里递归找 Barcelona 的 (rank, points)。"""
+    def walk(o):
+        if isinstance(o, dict):
+            entries = o.get("entries")
+            if isinstance(entries, list):
+                for ent in entries:
+                    if ent.get("team", {}).get("id") == str(BARCA_TEAM_ID):
+                        stats = {s.get("name"): s.get("value")
+                                 for s in ent.get("stats", [])}
+                        return stats.get("rank"), stats.get("points")
+            for v in o.values():
+                got = walk(v)
+                if got:
+                    return got
+        elif isinstance(o, list):
+            for v in o:
+                got = walk(v)
+                if got:
+                    return got
+        return None
+    return walk(standings)
+
+
+def get_barca():
+    """巴萨下一场 LaLiga 比赛(北京时间)+ 当前榜位积分;ESPN 公开接口。
+
+    fixture=true 只返回未赛日程;取第一场(只看 LaLiga,杯赛不在列)。
+    """
+    out = {"opponent": None, "venue": None, "when": None, "rank": None, "points": None}
+    sched = fetch_json("https://site.api.espn.com/apis/site/v2/sports/soccer/%s"
+                       "/teams/%d/schedule?fixture=true" % (BARCA_LEAGUE, BARCA_TEAM_ID))
+    now = time.time()
+    for e in sched.get("events", []):
+        try:
+            ts = calendar.timegm(time.strptime(e["date"], "%Y-%m-%dT%H:%MZ"))
+        except Exception:
+            continue
+        if ts < now:
+            continue
+        venue, opponent = "vs", None
+        for c in e["competitions"][0]["competitors"]:
+            if c["team"].get("id") == str(BARCA_TEAM_ID):
+                venue = "vs" if c.get("homeAway") == "home" else "@"
+            else:
+                opponent = (c["team"].get("shortDisplayName")
+                            or c["team"].get("displayName") or "?")
+        out["venue"], out["opponent"] = venue, opponent
+        out["when"] = time.strftime("%b %d %H:%M", time.gmtime(ts + 8 * 3600))
+        break
+    stand = fetch_json("https://site.api.espn.com/apis/v2/sports/soccer/%s/standings?season=%d"
+                       % (BARCA_LEAGUE, _laliga_season()))
+    got = _espn_barca_entry(stand)
+    if got and got[0] is not None:
+        out["rank"], out["points"] = _ordinal(got[0]), int(got[1] or 0)
+    return out
+
+
+def get_trending():
+    """GitHub Trending 今日第一仓(抓 github.com/trending 首屏 HTML,无官方 API)。"""
+    req = urllib.request.Request(TRENDING_URL, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+    with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+        html = resp.read().decode("utf-8", "replace")
+    for chunk in html.split("<article")[1:]:
+        h2 = re.search(r"<h2.*?</h2>", chunk, re.S)
+        repo = None
+        if h2:
+            m = re.search(r'href="/([^"]+)"', h2.group(0))
+            if m and "?" not in m.group(1) and "/" in m.group(1):
+                repo = m.group(1)
+        if not repo:
+            continue
+        stars = re.search(r"([\d,]+)\s*stars\s*today", chunk)
+        lang = re.search(r'itemprop="programmingLanguage">([^<]+)<', chunk)
+        total = re.search(r'href="/[^"]+/stargazers"[^>]*>\s*(?:<[^>]+>\s*)*([\d,]+)', chunk)
+        return {"repo": repo,
+                "stars_today": stars.group(1) if stars else "?",
+                "lang": lang.group(1) if lang else None,
+                "stars_total": total.group(1) if total else None}
+    raise ValueError("no trending repo parsed")
+
+
+
 def get_dashboard_data():
-    """拉取并整理数据;赛历是唯一主获取,其余三块独立容错(失败只影响对应区块)。"""
+    """拉取并整理数据;赛历是唯一主获取,其余各块独立容错(失败只影响对应区块)。"""
     # Kindle 时区未设置(按 UTC 走),更新时间按北京时间(UTC+8)显示
-    upd = time.strftime("%H:%M", time.gmtime(time.time() + 8 * 3600))
+    upd = time.gmtime(time.time() + 8 * 3600)
     out = {"next_race": None, "last_race": None, "standings": [],
            "constructors": [], "last_results": [],
            "progress": None, "season": None, "poster_sessions": [],
-           "upd": upd, "err": None}
+           "weather": None, "barca": None, "trending": None,
+           "upd": time.strftime("%H:%M", upd), "upd_stamp": time.strftime("%m-%d %H:%M", upd),
+           "err": None}
     try:
         cal = fetch("current.json")
     except Exception as exc:
@@ -452,19 +611,27 @@ def get_dashboard_data():
             out["last_results"] = fmt_results(races_res[0]["Results"])
     except Exception:
         pass
+
+    # 底部资讯盒三块(天气/巴萨/GitHub Trending):独立容错,失败留空对应盒子
+    for key, getter in (("weather", get_weather), ("barca", get_barca),
+                        ("trending", get_trending)):
+        try:
+            out[key] = getter()
+        except Exception as exc:
+            print("side panel %s failed: %r" % (key, repr(exc)[:60]))
     return out
 
 
 # ---------------- Pillow 屏保图片(png) ----------------
-# 单页 Timing Tower 编辑版式(600x800 设计区,× FULL_SCALE 铺满 758×1024):
-#   0-44    页眉黑条(赛车剪影 + F1 DASHBOARD + 斜纹)
-#   66-262  HERO:左侧下一场大字比赛名,右侧赛道轮廓主角
-#   272-340 开赛时间反色板(LIGHTS OUT · UTC+8;屏保零刷新,不渲染倒计时)
-#   352-373 赛季进度刻度尺
-#   388-650 双计时塔(车手/车队各 10 行,P1 行加粗,其余行灰字标落后差距)
-#   664-752 上场比赛领奖台 Top 3
-#   768     页脚(LAST UPDATE)
-# 事件海报(距开赛 <3 天)与领奖台/结果块共用同一字体/灰度/标签语法。
+# 报纸风面板网格(600x800 设计区,× FULL_SCALE 铺满 758×1024):
+#    8-792  外框(2px)
+#    8-62   大字标题条 DASHBOARD + 更新时间小牌(MM-DD HH:MM,北京时间)
+#   84-258  双积分榜 Top 5(标签牌 + 名次/大写名/点线引导/积分)
+#  266-271  粗分隔线
+#  288-470  NEXT RACE 面板:赛名大字 + Round N + 开赛时刻反色条 + 赛道轮廓
+#  484-606  LAST RACE 领奖台三栏(1st/2nd/3rd)
+#  620-778  资讯盒三联:每日天气 / 巴萨下一场 / GitHub Trending
+# 赛事海报(距开赛 <3 天)仍走反色海报版式,与面板版式共用字体/标签语法。
 
 def draw_track(d, box, pts):
     """赛道轮廓:pts 为 0-1000 网格坐标,box 为设计区坐标(自动加画布偏移)。"""
@@ -523,15 +690,6 @@ def draw_mark(d, box, rings, fill=0):
 
 
 GRAY_INK2, GRAY_LABEL, GRAY_SOFT, GRAY_FAINT = 90, 120, 170, 195
-
-
-def _leader_gap(leader, val):
-    """落后领先者的积分差;P1 行/无法计算(非数字积分)返回 ''。"""
-    try:
-        gap = int(float(leader)) - int(float(val))
-    except (TypeError, ValueError):
-        return ""
-    return "-%d" % gap if gap > 0 else ""
 
 
 def _font_candidates(bold):
@@ -619,87 +777,177 @@ def _season_ruler(d, x0, x1, y, done, total, tick_w=3.4, tick_h=9):
                     fill=0 if i < done else GRAY_FAINT)
 
 
-def _tower_block(d, font, text, x0, x1, label, rows, ty):
-    """计时塔区块:小标签 + 细线 + N 行(P1 加粗压细线,2 位起灰字标落后差距)。"""
-    _text_tracked(d, font, x0, ty, label, 12, fill=GRAY_LABEL)
-    d.line([fs(x0), fy(ty + 20), fs(x1), fy(ty + 20)], fill=GRAY_SOFT, width=lw(2))
-    ry = ty + 34
-    leader = rows[0][2] if rows else None
-    for i, (pos, name, val) in enumerate(rows):
-        lead = pos == "1"
-        text(x0, ry, pos, font(lead, 14), fill=0 if lead else GRAY_FAINT, anchor="lm")
-        text(x0 + 24, ry, name, font(lead, 16), anchor="lm")
-        text(x1, ry, str(val), font(True, 16), anchor="rm")
-        gap = _leader_gap(leader, val)
-        if gap:
-            # 差距列贴在积分左侧,宽度按积分实宽右对齐(窄体 3 位积分 ≈26 设计px)
-            pw = d.textlength(str(val), font=font(True, 16)) / (FULL_SCALE * AA_SCALE)
-            text(x1 - pw - 8, ry, gap, font(False, 12), fill=GRAY_LABEL, anchor="rm")
-        ry += 24
-        if i == 0:
-            # 分隔线落在 24px 行距的中点,距上下两行文字各留 ~4px
-            d.line([fs(x0), fy(ry - 12), fs(x1), fy(ry - 12)], fill=GRAY_SOFT, width=lw(1))
+def _ordinal(n):
+    """1 → '1st'(领奖台名次 / 巴萨榜位共用)。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if 11 <= n % 100 <= 13:
+        return "%dth" % n
+    return "%d%s" % (n, {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th"))
+
+
+def _dots(d, x0, x1, cy, fill=0, step=5, r=1.2):
+    """点线引导(榜名与积分之间的省略号),设计区坐标。"""
+    x = x0
+    while x < x1:
+        d.ellipse([fs(x - r), fy(cy - r), fs(x + r), fy(cy + r)], fill=fill)
+        x += step
+
+
+def _ellipsize(d, font, s, max_w, size, bold=False):
+    """按设计区宽度截断长串(越界加 '...'),资讯盒仓库名用。"""
+    if d.textlength(s, font=font(bold, size)) / (FULL_SCALE * AA_SCALE) <= max_w:
+        return s
+    while s and d.textlength(s + "...", font=font(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+        s = s[:-1]
+    return s + "..."
+
+
+def _standings_rows(d, font, text, x0, x1, rows, y0, step=26):
+    """积分榜 Top 5:名次 + 大写名 + 点线引导 + 右对齐积分(全黑,报纸语法)。"""
+    ry = y0
+    for pos, name, val in rows[:5]:
+        name, val = str(name), str(val)
+        text(x0, ry, str(pos), font(True, 13), anchor="lm")
+        text(x0 + 34, ry, name, font(True, 15), anchor="lm")
+        nw = d.textlength(name, font=font(True, 15)) / (FULL_SCALE * AA_SCALE)
+        pw = d.textlength(val, font=font(True, 15)) / (FULL_SCALE * AA_SCALE)
+        _dots(d, x0 + 34 + nw + 8, x1 - 8 - pw - 8, ry)
+        text(x1 - 8, ry, val, font(True, 15), anchor="rm")
+        ry += step
+
+
+def _info_box(d, font, text, x0, x1, title, lines, note=None, y0=620, y1=778):
+    """底部资讯盒:居中标题 + 下划线 + '- ' 行列(天气/巴萨/Trending 共用)。"""
+    cx = (x0 + x1) / 2
+    d.rectangle([fs(x0), fy(y0), fs(x1) - 1, fy(y1) - 1], outline=0, width=lw(2))
+    text(cx, y0 + 12, title, font(True, 13), anchor="ma")
+    d.line([fs(x0 + 14), fy(y0 + 30), fs(x1 - 14), fy(y0 + 30)], fill=0, width=lw(2))
+    if not lines:
+        lines = ["no data"]
+    ly = y0 + 46
+    for s in lines:
+        if s:
+            # 加粗:12px 常规体在 e-ink 上笔画太细,发虚难读
+            text(x0 + 12, ly, "- %s" % s, font(True, 12))
+        ly += 24
+    if note:
+        _text_tracked(d, font, cx, y1 - 16, note, 7, fill=GRAY_LABEL, anchor="ma")
+
+
+def _draw_info_boxes(d, data, font, text):
+    """底部三资讯盒:每日天气 / 巴萨下一场 / GitHub Trending(数据已各自容错)。"""
+    w, b, t = data.get("weather"), data.get("barca"), data.get("trending")
+
+    wlines = []
+    if w:
+        today, tom = w["today"], w["tomorrow"]
+        rain = " %d%%" % today["pop"] if today["pop"] >= 30 else ""
+        wlines = ["High %d°C  Low %d°C" % (today["high"], today["low"]),
+                  "%s%s" % (today["text"], rain),
+                  "Tomorrow %s %d°C" % (tom["text"], tom["high"])]
+    _info_box(d, font, text, 28, 206, "%s TODAY" % (w["city"] if w else "WEATHER"),
+              wlines, note="daily forecast — not current temp")
+
+    blines = []
+    if b:
+        if b["opponent"]:
+            blines.append("Next %s %s" % (b["venue"] or "vs", b["opponent"]))
+        if b["when"]:
+            blines.append(b["when"])
+        if b["rank"]:
+            blines.append("LaLiga %s · %d points" % (b["rank"], b["points"]))
+    _info_box(d, font, text, 218, 392, "FC BARCELONA", blines)
+
+    tlines = []
+    if t:
+        tlines.append(_ellipsize(d, font, "#1 %s" % t["repo"], 148, 12, bold=True))
+        tlines.append("%s stars today" % t["stars_today"])
+        if t["lang"]:
+            tlines.append("trending in %s" % t["lang"])
+    _info_box(d, font, text, 404, 572, "GITHUB TRENDING", tlines)
 
 
 def _draw_dashboard(d, data, font, text):
-    """默认仪表盘版式(非赛事周末):Timing Tower 编辑风格。
+    """默认仪表盘版式(非赛事周末):报纸风面板网格(见区块注释)。
 
-    屏保零刷新,一切"相对当前时刻"的动态文案(倒计时)不渲染,只展示静态事实。
+    屏保零刷新,一切"相对当前时刻"的动态文案不渲染,只展示静态事实。
     """
-    MARGIN, RIGHT = 28, 572
-    _masthead(d, font, text)
+    CX = 300
+
+    # 外框
+    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
+
+    # 标题条(顶/右边与外框合并)+ 更新时间小牌(北京时间 MM-DD HH:MM)
+    d.rectangle([fs(134), fy(8), fs(592) - 1, fy(62) - 1], outline=0, width=lw(2))
+    text(360, 35, "DASHBOARD", font(True, _fit(d, font, "DASHBOARD", 424, 40)),
+         anchor="mm")
+    d.rectangle([fs(18), fy(8), fs(90) - 1, fy(32) - 1], outline=0, width=lw(2))
+    _text_tracked(d, font, 54, 14, data["upd_stamp"], 8, anchor="ma", track=1)
+
+    # 双积分榜 Top 5:标签牌 + 行列(无外框,点线引导)
+    for x0, x1, label, rows in (
+            (28, 292, "DRIVER STANDINGS — TOP 5",
+             [(p, surname(n), v) for p, n, v in data["standings"]]),
+            (308, 572, "CONSTRUCTOR STANDINGS — TOP 5",
+             [(p, n.upper(), v) for p, n, v in data["constructors"]])):
+        d.rectangle([fs(x0), fy(84), fs(x1) - 1, fy(114) - 1], outline=0, width=lw(2))
+        text((x0 + x1) / 2, 99, label, font(True, _fit(d, font, label, x1 - x0 - 16, 13)),
+             anchor="mm")
+        _standings_rows(d, font, text, x0, x1, rows, 132)
+
+    # 粗分隔线
+    d.rectangle([fs(28), fy(266), fs(572) - 1, fy(271)], fill=0)
+
+    # NEXT RACE 面板:左文(赛名/轮次/开赛条)右图(赛道轮廓),竖线分隔
+    d.rectangle([fs(28), fy(288), fs(572) - 1, fy(470) - 1], outline=0, width=lw(2))
     nr = data["next_race"]
+    if nr is None:
+        text(CX, 379, "SEASON COMPLETE", font(True, 20), anchor="mm")
+    else:
+        d.rectangle([fs(44), fy(276), fs(140) - 1, fy(300) - 1],
+                    fill=255, outline=0, width=lw(2))
+        text(92, 288, "NEXT RACE", font(True, 12), anchor="mm")
+        name = nr["raceName"].upper()
+        text(44, 314, name, font(True, _fit(d, font, name, 304, 30)))
+        text(44, 352, "Round %s" % nr["round"], font(True, 24))
+        # 开赛时刻反色条(北京时间)
+        d.rectangle([fs(44), fy(428), fs(346) - 1, fy(456) - 1], fill=0)
+        when = "LIGHTS OUT  %s  %s" % (short_date(nr["date"]),
+                                       format_race_daytime(nr) or "TBD")
+        text(58, 442, when, font(True, _fit(d, font, when, 280, 14)), fill=255, anchor="lm")
+        d.line([fs(364), fy(302), fs(364), fy(458)], fill=0, width=lw(2))
+        pts = get_track(nr["Circuit"]["circuitId"])
+        if pts:
+            draw_track_fit(d, fbox(378, 302, 560, 420), pts, fill=0, width=3)
+        cap = (nr["Circuit"].get("circuitName")
+               or nr["Circuit"].get("circuitId") or "").replace("_", " ").upper()
+        _text_tracked(d, font, 468, 434, cap,
+                      _fit(d, font, cap, 176, 9, bold=False, min_size=7),
+                      fill=GRAY_LABEL, anchor="ma", track=1)
 
-    # HERO:左文右图,赛道轮廓为页面主角
-    place, sub = split_race_name(nr)
-    _text_tracked(d, font, MARGIN, 66, "NEXT RACE · ROUND %s" % nr["round"], 13,
-                  fill=GRAY_LABEL)
-    nsz = _fit(d, font, place, 300 - MARGIN - 8, 44)
-    text(MARGIN, 90, place, font(True, nsz))
-    _text_tracked(d, font, MARGIN, 90 + nsz + 8, sub, 16, fill=GRAY_INK2, track=4)
-    pts = get_track(nr["Circuit"]["circuitId"])
-    if pts:
-        draw_track_fit(d, fbox(312, 58, 572, 262), pts, fill=0, width=4)
+    # LAST RACE 领奖台三栏
+    d.rectangle([fs(28), fy(484), fs(572) - 1, fy(606) - 1], outline=0, width=lw(2))
+    last = data["last_race"]
+    if last is not None:
+        last_place, _ = split_race_name(last)
+        head = "LAST RACE — %s" % last_place
+        text(CX, 506, head, font(True, _fit(d, font, head, 420, 21)), anchor="mm")
+        d.line([fs(44), fy(528), fs(556), fy(528)], fill=0, width=lw(2))
+        d.line([fs(213), fy(540), fs(213), fy(596)], fill=0, width=lw(2))
+        d.line([fs(387), fy(540), fs(387), fy(596)], fill=0, width=lw(2))
+        for i, (pos, name, _gap) in enumerate(data["last_results"][:3]):
+            nm = surname(name)
+            cx = (128, 300, 472)[i]
+            text(cx, 544, _ordinal(pos), font(False, 13), anchor="ma")
+            text(cx, 566, nm, font(True, _fit(d, font, nm, 128, 18)), anchor="ma")
+    else:
+        text(CX, 545, "NO RACE YET", font(True, 16), anchor="mm")
 
-    # 开赛时间板:全页唯一反色锚点(北京时间)
-    py0, py1 = 272, 340
-    d.rectangle([fs(MARGIN), fy(py0), fs(RIGHT) - 1, fy(py1)], fill=0)
-    _text_tracked(d, font, 46, py0 + 8, "LIGHTS OUT · UTC+8", 12, fill=210)
-    day = format_race_daytime(nr) or ""
-    when = "%s · %s" % (short_date(nr["date"]), day) if day else short_date(nr["date"])
-    text(46, py0 + 26, when, font(True, _fit(d, font, when, 500, 34)), fill=255)
-
-    # 赛季进度刻度尺
-    done, total = data["progress"] or (0, 0)
-    _text_tracked(d, font, MARGIN, 352, "SEASON %s" % data["season"], 12, fill=GRAY_LABEL)
-    _season_ruler(d, MARGIN + 112, 486, 364, done, total)
-    text(RIGHT, 356, "%d/%d" % (done, total), font(True, 16), anchor="ra")
-
-    # 计时塔:车手 / 车队
-    ty = 388
-    _tower_block(d, font, text, MARGIN, 290, "DRIVER STANDINGS",
-                 [(p, surname(n), v) for p, n, v in data["standings"]], ty)
-    _tower_block(d, font, text, 322, RIGHT, "CONSTRUCTOR STANDINGS",
-                 [(p, n.upper(), v) for p, n, v in data["constructors"]], ty)
-
-    # 上场比赛:领奖台 Top 3
-    if data["last_race"]:
-        last_place, _ = split_race_name(data["last_race"])
-        ly = 664
-        _text_tracked(d, font, MARGIN, ly, "LAST RACE · %s" % last_place, 12, fill=GRAY_LABEL)
-        d.line([fs(MARGIN), fy(ly + 20), fs(RIGHT), fy(ly + 20)], fill=GRAY_SOFT, width=lw(2))
-        ry = ly + 34
-        for pos, name, gap in data["last_results"][:3]:
-            lead = pos == "1"
-            text(MARGIN, ry, pos, font(lead, 14), fill=0 if lead else GRAY_FAINT, anchor="lm")
-            text(MARGIN + 24, ry, surname(name), font(lead, 16), anchor="lm")
-            text(RIGHT, ry, gap, font(lead, 15), fill=0 if lead else GRAY_INK2, anchor="rm")
-            ry += 22
-
-    # 页脚
-    d.line([fs(MARGIN), fy(768), fs(RIGHT), fy(768)], fill=GRAY_SOFT, width=lw(1))
-    _text_tracked(d, font, MARGIN, 776, "LAST UPDATE %s" % data["upd"], 12,
-                  fill=GRAY_LABEL, track=1)
+    # 底部资讯盒:天气 / 巴萨 / GitHub Trending
+    _draw_info_boxes(d, data, font, text)
 
 
 def _poster_footer(d, data, font, text, nr):
@@ -906,6 +1154,391 @@ def service_mode():
         time.sleep(3)
 
 
+# ---------------- 常显模式(always-on) ----------------
+#
+# 与 service 模式互补的信息牌形态:设备永不入睡,每小时开 Wi-Fi 拉一次成图,
+# eips 直接全屏显示后关 Wi-Fi。PW1 的 RTC 闹钟无法从挂起唤醒内核(见文件头),
+# 睡着就刷不了;常显等于用续航换全天候实时。
+# 前置光始终关闭 —— 常显模式下它是最大的单一耗电源。
+# 循环内每轮重申防入睡标志并重试熄灯,防框架重置。
+
+ALWAYS_OUT = "/mnt/us/f1dash/latest.png"   # eips 全屏显示用成图
+ALWAYS_INTERVAL = 3600                     # 常显刷新周期(秒)
+BATT_SYSFS = "/sys/devices/system/yoshi_battery/yoshi_battery0"
+BATT_LOG = "/mnt/us/f1dash/battery.csv"    # 电池采样 CSV(battreport 消费)
+BATT_SAMPLE = 60                           # 采样周期:电芯计量更新缓慢,秒级无意义
+
+
+def _sysfs_int(name):
+    """读 BATT_SYSFS 下整数节点;缺失/异常返回 None。"""
+    try:
+        with open(os.path.join(BATT_SYSFS, name)) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _sysfs_raw(name):
+    """读 BATT_SYSFS 原始字符串节点(如 battery_capacity="83%");缺失返回 ""。"""
+    try:
+        with open(os.path.join(BATT_SYSFS, name)) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def keep_awake(on=True):
+    """阻止入睡与屏保(powerd preventScreenSaver,本机 5.6.1.1 实测可写可读回)。
+
+    每轮循环重申一次,防框架重置;关闭时归零恢复正常睡眠。
+    """
+    try:
+        subprocess.run(["lipc-set-prop", "com.lab126.powerd",
+                        "preventScreenSaver", "1" if on else "0"],
+                       capture_output=True, timeout=5)
+    except Exception as exc:
+        log("keep_awake(%s) failed: %r" % (on, exc))
+
+
+def front_light_off():
+    """熄灭前置光(powerd flIntensity/flAuto,本机实测属性名)。
+
+    每轮循环重试,常态下漏关的可能性被压到最低;失败仅记日志不影响刷新。
+    """
+    try:
+        subprocess.run(["lipc-set-prop", "com.lab126.powerd", "flIntensity", "0"],
+                       capture_output=True, timeout=5)
+        subprocess.run(["lipc-set-prop", "com.lab126.powerd", "flAuto", "0"],
+                       capture_output=True, timeout=5)
+    except Exception as exc:
+        log("front light off failed: %r" % exc)
+
+
+def framework_pids():
+    """GUI 框架/状态栏渲染进程 pid 列表(cmdline 含 framework 或 pillowd)。
+
+    本机 ps 列不全进程,必须扫 /proc;排除含 f1dash 的命令行避免误伤自身脚本。
+    """
+    pids = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % name, "rb") as f:
+                cmd = f.read()
+        except Exception:
+            continue
+        if (b"framework" in cmd or b"pillowd" in cmd) and b"f1dash" not in cmd:
+            pids.append(name)
+    return pids
+
+
+def framework_stop():
+    """停掉 GUI 框架与 pillow 渲染器(upstart job):没有它们就没有东西往帧缓冲上画。
+
+    实测(PW1 5.6.1.1):只停 framework 不够 —— pillowd(状态栏/对话框渲染进程)
+    还在跑,时钟仍会周期刷新盖屏;两个都停才干净。wifid/powerd 是独立守护,
+    不受影响。恢复用 always_on_stop.sh(start framework + start pillow);
+    万一都不可用,重启 Kindle 也是干净出口。
+    """
+    ok = True
+    for job in ("framework", "pillow"):
+        try:
+            r = subprocess.run(["/sbin/stop", job], capture_output=True, timeout=15)
+            if r.returncode != 0:
+                log("stop %s: %s" % (job, (r.stderr or r.stdout)[:60]))
+                ok = False
+        except Exception as exc:
+            log("stop %s failed: %r" % (job, exc))
+            ok = False
+    return ok
+
+
+def framework_ensure_stopped():
+    """确保 GUI 进程都停着:每轮循环检查,被系统重新拉起就再停一次。"""
+    if framework_pids():
+        framework_stop()
+        return True
+    return False
+
+
+def wifi(on):
+    """Wi-Fi 开关:直接指挥 wifid(独立守护,framework 生死都可用)。
+
+    com.lab126.cmd wirelessEnable 是 UI 层开关,由 framework 进程提供:
+    框架活着时一调就弹飞行模式对话框盖屏,框架死了则无人响应——常显模式
+    两个都不能要。wifid enable 实测框架生死均可关联(见 wifitest 记录)。
+    cmd 仅作 wifid 调用异常时的后备(需框架活着)。
+    """
+    val = "1" if on else "0"
+    try:
+        subprocess.run(["lipc-set-prop", "com.lab126.wifid", "enable", val],
+                       capture_output=True, timeout=5)
+        return True
+    except Exception as exc:
+        log("wifid enable(%s) failed: %r" % (on, exc))
+        try:
+            subprocess.run(["lipc-set-prop", "com.lab126.cmd",
+                            "wirelessEnable", val], capture_output=True, timeout=5)
+        except Exception as exc2:
+            log("cmd wirelessEnable(%s) failed: %r" % (on, exc2))
+        return False
+
+
+def wait_network(timeout=60):
+    """等 Wi-Fi 完成关联并拿到默认路由;超时返回 False。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open("/proc/net/route") as f:
+                for line in f.read().splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) > 1 and parts[1] == "00000000":
+                        return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+
+def show_fullscreen(path=ALWAYS_OUT):
+    """eips 显示成图:-g 解析 PNG,-f 全刷清残影;758x1024 原图无需缩放定位。
+
+    本机 eips 把第一个非旗标参数当图片路径,-f 必须放在路径之后
+    (`eips -g <path> -f`,实测 `eips -g -f <path>` 会去 fopen "-f" 报 rc=1);
+    eips 不在默认 PATH(/usr/sbin),必须用绝对路径。
+    """
+    try:
+        r = subprocess.run(["/usr/sbin/eips", "-g", path, "-f"],
+                           capture_output=True, timeout=30)
+        if r.returncode != 0:
+            log("eips rc=%d %s; fallback partial update"
+                % (r.returncode, r.stderr[:60]))
+            subprocess.run(["/usr/sbin/eips", "-g", path],
+                           capture_output=True, timeout=30)
+    except Exception as exc:
+        log("show failed: %r" % exc)
+
+
+def always_cycle():
+    """一轮常显刷新:开 Wi-Fi → 拉图(显示图+锁屏图)→ 全屏显示 → 关 Wi-Fi。
+
+    无网络或拉图失败都保留上一张图并照样重显示,屏面始终有内容。
+    """
+    t0 = time.time()
+    wifi(True)
+    net = wait_network()
+    pulled = False
+    if net:
+        pulled = pull_image(outs=(ALWAYS_OUT, SS_OUT))
+        if not pulled:
+            log("cycle: pull failed; keep last image")
+    else:
+        log("cycle: no network; keep last image")
+    if os.path.exists(ALWAYS_OUT):
+        show_fullscreen()
+    wifi(False)
+    cap = _sysfs_raw("battery_capacity") or "?"
+    log("cycle done in %ds: net=%s pull=%s battery %s"
+        % (time.time() - t0, net, pulled, cap))
+
+
+def daemonize():
+    """双 fork + setsid 脱离会话(设备无 nohup/setsid 命令,在 python 里做)。
+
+    SSH 会话正常关闭、或被周期关 Wi-Fi 强行断连后 sshd 延迟收网,都杀不到
+    已 setsid 的守护进程;父进程立即退出,KUAL/SSH 调用秒回。
+    调试时设 F1DASH_NO_DAEMON=1 前台跑。
+    """
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    null = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(null, fd)
+    if null > 2:
+        os.close(null)
+
+
+def always_on_mode(interval=None):
+    """常显主循环:启动即刷一轮,之后每 interval 秒重申防入睡并再刷一轮。
+
+    间隔优先级:--interval 参数 > F1DASH_ALWAYSON_INTERVAL 环境变量 > 默认 3600。
+    实际等待超过预期 2 分钟视为发生过挂起(常显模式不该出现),记日志供排查。
+    """
+    if not interval:
+        interval = os.environ.get("F1DASH_ALWAYSON_INTERVAL") or ALWAYS_INTERVAL
+    interval = int(interval)
+    try:
+        with open("/var/run/f1dash_alwayson.pid", "w") as f:
+            f.write(str(os.getpid()))
+    except Exception as exc:
+        log("pidfile write failed: %r" % exc)
+    log("always-on started (interval %ds, pid %d)" % (interval, os.getpid()))
+    BatteryMeter().start()
+    keep_awake(True)
+    front_light_off()
+    if framework_stop():
+        log("framework stopped; screen is ours alone")
+    else:
+        log("warning: framework stop failed; chrome may repaint over the image")
+    always_cycle()
+    while True:
+        t0 = time.time()
+        time.sleep(interval)
+        elapsed = time.time() - t0
+        if elapsed > interval + 120:
+            log("warning: %ds gap in loop — system suspended?" % round(elapsed))
+        keep_awake(True)
+        front_light_off()
+        if framework_ensure_stopped():
+            log("framework respawned; stopped it again")
+        always_cycle()
+
+
+class BatteryMeter(threading.Thread):
+    """常显内置电池计量:每 BATT_SAMPLE 秒读电芯计量并追加写 CSV 一行。
+
+    常显续航取决于实测放电速率。yoshi 电芯计量的 battery_current 原始单位
+    不明,但 battery_mAH/battery_capacity 直接给出荷电状态,用它们随时间的
+    衰减算放电速率与续航,不依赖电流单位;插电期间行内 charging=1 供剔除。
+    """
+
+    def __init__(self, path=BATT_LOG, sample=BATT_SAMPLE):
+        threading.Thread.__init__(self)
+        self.daemon = True
+        self.path = path
+        self.sample = sample
+        self._stop = threading.Event()
+
+    def _charging(self):
+        try:
+            out = subprocess.run(["lipc-get-prop", "com.lab126.powerd",
+                                  "isCharging"], capture_output=True, text=True,
+                                 timeout=5)
+            return out.stdout.strip() == "1"
+        except Exception:
+            return False
+
+    def run(self):
+        if not os.path.isdir(BATT_SYSFS):
+            log("battery meter disabled: no %s" % BATT_SYSFS)
+            return
+        try:
+            if not os.path.exists(self.path):
+                with open(self.path, "w") as f:
+                    f.write("unix_ts,time,pct,mah,lmd_mah,mv,ua_raw,temp_dC,"
+                            "charging\n")
+        except Exception as exc:
+            log("battery meter disabled: csv %r" % exc)
+            return
+        # 重启标记:battreport 用它区分"进程重启造成的采样空洞"与"设备挂起"
+        try:
+            with open(self.path, "a") as f:
+                f.write("# restart %d %s\n" % (time.time(),
+                                               time.strftime("%Y-%m-%d %H:%M:%S")))
+        except Exception:
+            pass
+        while not self._stop.wait(self.sample):
+            line = "%d,%s,%s,%s,%s,%s,%s,%s,%d\n" % (
+                time.time(), time.strftime("%Y-%m-%d %H:%M:%S"),
+                _sysfs_raw("battery_capacity"), _sysfs_raw("battery_mAH"),
+                _sysfs_raw("battery_lmd"), _sysfs_raw("battery_voltage"),
+                _sysfs_raw("battery_current"),
+                _sysfs_raw("battery_temperature"),
+                1 if self._charging() else 0)
+            try:
+                with open(self.path, "a") as f:
+                    f.write(line)
+            except Exception:
+                pass
+
+
+def battreport(path=BATT_LOG):
+    """汇总电池采样 CSV:放电速率、平均功率、外推续航,并检测入睡空洞。
+
+    放电速率用 battery_mAH 随时间衰减计算(不依赖电流原始单位,插电行剔除);
+    行间空洞 >5 分钟视为发生过挂起(常显模式不该出现),显式列出。
+    """
+    rows, restarts = [], []
+    try:
+        with open(path) as f:
+            next(f)
+            for line in f:
+                if line.startswith("# restart"):
+                    try:
+                        restarts.append(float(line.split()[2]))
+                    except (ValueError, IndexError):
+                        pass
+                    continue
+                p = line.strip().split(",")
+                if len(p) != 9:
+                    continue
+                try:
+                    rows.append({"ts": float(p[0]), "t": p[1],
+                                 "pct": int(p[2].rstrip("%") or -1),
+                                 "mah": float(p[3] or 0),
+                                 "lmd": float(p[4] or 0),
+                                 "mv": float(p[5] or 0),
+                                 "ua": float(p[6] or 0),
+                                 "tc": float(p[7] or 0),
+                                 "chg": p[8] == "1"})
+                except ValueError:
+                    continue
+    except Exception as exc:
+        print("no battery log: %r" % exc)
+        return 1
+    rows.sort(key=lambda r: r["ts"])
+    if len(rows) < 2:
+        print("not enough samples yet (%d rows)" % len(rows))
+        return 1
+
+    print("window: %s .. %s  (%.1f h, %d rows, %d discharging)"
+          % (rows[0]["t"], rows[-1]["t"],
+             (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0, len(rows),
+             sum(1 for r in rows if not r["chg"])))
+
+    gaps = [(rows[i - 1]["ts"], rows[i]["ts"]) for i in range(1, len(rows))
+            if rows[i]["ts"] - rows[i - 1]["ts"] > 300]
+    slept = False
+    for g0, g1 in gaps:
+        if any(g0 < rts <= g1 for rts in restarts):
+            print("RESTART GAP: %d s — process restarted mid-log, not a suspend"
+                  % round(g1 - g0))
+        else:
+            print("SUSPEND GAP: %d s — device slept, keep-awake failed"
+                  % round(g1 - g0))
+            slept = True
+    if slept:
+        return 1
+
+    disch = [r for r in rows if not r["chg"]]
+    if len(disch) < 2:
+        print("not enough discharging samples (plugged in whole window?)")
+        return 1
+    span_h = (disch[-1]["ts"] - disch[0]["ts"]) / 3600.0
+    used = disch[0]["mah"] - disch[-1]["mah"]
+    if span_h <= 0 or used <= 0:
+        print("no measurable drain over %.1f h (rate below gauge resolution)"
+              % span_h)
+        return 0
+    rate = used / span_h                       # mAh/h,数值上即 mA
+    mv = sum(r["mv"] for r in disch) / len(disch)
+    mw = rate * mv / 1000.0
+    print("drain: %.2f mAh/h (%.1f mA-equiv) = %.1f mW @ %.0f mV"
+          % (rate, rate, mw, mv))
+    print("used %.1f mAh; now %s, lmd %.0f mAh (true full capacity)"
+          % (used, disch[-1]["pct"], disch[-1]["lmd"]))
+    days_empty = disch[-1]["mah"] / rate / 24.0
+    lmd = disch[-1]["lmd"] or disch[-1]["mah"]
+    days_10 = max(0.0, disch[-1]["mah"] - 0.1 * lmd) / rate / 24.0
+    print("projected: %.1f days to empty, %.1f days to 10%% reserve"
+          % (days_empty, days_10))
+    return 0
+
+
 # ---------------- 入口 ----------------
 
 def mock_data(err=False, poster=False):
@@ -941,6 +1574,7 @@ def mock_data(err=False, poster=False):
         next_race = {"raceName": "Abu Dhabi Grand Prix", "round": "23",
                      "date": "2026-12-06", "time": "13:00:00Z",
                      "Circuit": {"circuitId": "yas_marina",
+                                 "circuitName": "Yas Marina Circuit",
                                  "Location": {"locality": "Abu Dhabi",
                                               "country": "United Arab Emirates"}}}
         last_race = {"raceName": "Qatar Grand Prix", "round": "22"}
@@ -963,10 +1597,20 @@ def mock_data(err=False, poster=False):
                          ("3", "Oscar Piastri", "+18.362"),
                          ("4", "Charles Leclerc", "+22.054"),
                          ("5", "George Russell", "Power Unit")],
+        "weather": None if err else {
+            "city": "HANGZHOU",
+            "today": {"high": 21, "low": 16, "text": "Showers", "pop": 100},
+            "tomorrow": {"high": 20, "low": 15, "text": "Drizzle", "pop": 18}},
+        "barca": None if err else {"opponent": "Villarreal", "venue": "vs",
+                                   "when": "Nov 22 21:00", "rank": "1st", "points": 33},
+        "trending": None if err else {"repo": "alibaba/open-code-review",
+                                      "stars_today": "1,925", "lang": "TypeScript",
+                                      "stars_total": "50,985"},
         "progress": None if err else (11, 23),
         "season": None if err else ("2026" if poster else "2026"),
         "poster_sessions": [] if err else poster_sessions,
-        "upd": "12:34",
+        "upd": "16:20",
+        "upd_stamp": "11-14 16:20",
         "err": Exception("network unreachable") if err else None,
     }
 
@@ -980,6 +1624,26 @@ def main():
     if mode == "service":
         service_mode()
         return 0
+    if mode == "alwayson":
+        # 已在运行则不重复启动(防 KUAL/SSH 双开);pid 会被系统回收,须校验属主
+        try:
+            old = int(open("/var/run/f1dash_alwayson.pid").read().strip())
+            if os.path.isdir("/proc/%d" % old):
+                with open("/proc/%d/cmdline" % old, "rb") as f:
+                    if b"alwayson" in f.read():
+                        print("f1dash alwayson already running (pid %d)" % old)
+                        return 0
+        except Exception:
+            pass
+        itv = None
+        if "--interval" in argv:
+            itv = argv[argv.index("--interval") + 1]
+        if os.environ.get("F1DASH_NO_DAEMON") != "1":
+            daemonize()
+        always_on_mode(itv)
+        return 0
+    if mode == "battreport":
+        return battreport()
     if mode == "pull":
         return 0 if pull_screensaver(out=out) else 1
     if mode == "refresh":

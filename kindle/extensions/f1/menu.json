@@ -9,6 +9,11 @@
                     "exitmenu": false
                 },
                 {
+                    "name": "Always On: OFF",
+                    "action": "sh /mnt/us/extensions/f1/bin/always_on_toggle.sh",
+                    "exitmenu": false
+                },
+                {
                     "name": "Auto Sleep: OFF",
                     "action": "sh /mnt/us/extensions/f1/bin/autosleep_toggle.sh",
                     "exitmenu": false

@@ -12,6 +12,9 @@ if [ -n "$OLDPID" ] && [ -d "/proc/$OLDPID" ] && \
 fi
 rm -f "$PIDFILE"
 
+# 与常显模式互斥:睡眠刷新服务和常显都管屏面,同时跑会打架
+sh /mnt/us/extensions/f1/bin/always_on_stop.sh >/dev/null 2>&1
+
 # 立即刷新一次屏保图(下载云端成图;失败保留上一张)
 /mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py refresh
 

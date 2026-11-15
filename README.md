@@ -6,24 +6,24 @@
 
 ```
 +------------------------------------------------+
-| 🪖 DASHBOARD                             <F1标> |  ← 页眉:头盔图标 + 官方 F1 徽标
-| NEXT RACE · ROUND 21      |   赛道轮廓图(主角)  |
-| LAS VEGAS                 |                    |
-| GRAND PRIX                |                    |
-+------------------------------------------------+
-| LIGHTS OUT · UTC+8                             |
-| NOV 22 · SUNDAY 12:00                          |  ← 反色开赛时刻板
-+------------------------------------------------+
-| SEASON 2026  ▮▮▮▮▮▮▮▮▮▯▯  20/23                |
+| 11-14 20:13      |       DASHBOARD              |  ← 大字标题条(顶边并入外框,左上角为更新时刻)
 +----------------------+-------------------------+
-| DRIVER STANDINGS     | CONSTRUCTOR STANDINGS   |
-| 1 ANTONELLI      390 | 1 MERCEDES        652   |
-| 2 VERSTAPPEN -111 279 | 2 FERRARI      -142 510 |
-| ...                  | ...                     |
-+----------------------+-------------------------+
-| LAST RACE · BRAZILIAN                          |
-| 1 NORRIS                          1:35:23.504  |
-| Last update 14:15                              |
+| DRIVER STANDINGS — TOP 5 | CONSTRUCTOR — TOP 5 |
+| 1 ANTONELLI ......... 390 | 1 MERCEDES ..... 652 |
+| ...                       | ...                 |
++------------------------------------------------+
+| NEXT RACE                                      |
+| LAS VEGAS GRAND PRIX      |   赛道轮廓图        |
+| Round 21                  |   LAS VEGAS STRIP…  |
+| [LIGHTS OUT  NOV 22  SUNDAY  12:00]            |  ← 反色开赛时刻条
++------------------------------------------------+
+| LAST RACE — BRAZILIAN                          |
+|     1st        |      2nd       |     3rd      |
+|   NORRIS       |  VERSTAPPEN    |   HADJAR     |
++----------------+----------------+--------------+
+| HANGZHOU TODAY  | FC BARCELONA | GITHUB TRENDING|
+| - High/Low/降水 | - Next match | - #1 repo      |
+| - 明日概要      | - 开球(北京) | - stars today |
 +------------------------------------------------+
 ```
 
@@ -31,14 +31,15 @@
 > 大号赛道轮廓作主角 + 比赛名/地点 + 大字开赛时刻,氛围更浓;
 > 周末里排位赛/冲刺赛结束后,海报**渐进**补出对应赛果(Top 5),正赛前更"有用"。
 
-数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,免费、无需 Key)。赛道轮廓图形来自 [F1DB circuit assets](https://github.com/f1db/f1db/tree/main/src/assets/circuits)(Jules Roy,CC BY 4.0);页眉头盔图标来自 [Material Design Icons](https://pictogrammers.com)(Pictogrammers,Apache 2.0,`racing-helmet`);页眉 F1 徽标来自 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Formula_One_logo.svg)(Public domain;F1 徽标为 Formula One Group 注册商标,仅个人非商用显示)。渲染上移云端后,Kindle 只下载成图、不做本机渲染:云端不可达时直接保留最后一张屏保图。
+F1 数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,免费、无需 Key);底部资讯盒三块同样免费免 Key:天气取 [Open-Meteo](https://open-meteo.com) **每日预报**(杭州:当日高低温/天气/降水概率 + 明日概要,不取几分钟后就失真的当前气温),足球取 [ESPN 公开接口](https://site.api.espn.com)(巴萨下一场 LaLiga 比赛 + 榜位积分,北京时间),GitHub Trending 抓取 [github.com/trending](https://github.com/trending) 首页(今日第一仓 + stars today)。赛道轮廓图形来自 [F1DB circuit assets](https://github.com/f1db/f1db/tree/main/src/assets/circuits)(Jules Roy,CC BY 4.0);页眉头盔图标来自 [Material Design Icons](https://pictogrammers.com)(Pictogrammers,Apache 2.0,`racing-helmet`);页眉 F1 徽标来自 [Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Formula_One_logo.svg)(Public domain;F1 徽标为 Formula One Group 注册商标,仅个人非商用显示,赛事海报页眉仍在用)。渲染上移云端后,Kindle 只下载成图、不做本机渲染:云端不可达时直接保留最后一张屏保图。
 
 ## 功能
 
 - **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后自动下载云端成图(秒级)
 - **一键回睡(Auto Sleep)**:信息牌模式下按一下电源键 → Kindle 秒级拉取新图 → 自动回睡,锁屏永远是最新的;想正常阅读时在 KUAL 菜单切回 OFF
+- **常显模式(Always On)**:设备永不入睡,每小时开 Wi-Fi → 下载云端成图 → eips 全屏显示 → 关 Wi-Fi,前置光强制关闭;与"信息牌+一键回睡"互补,是全天候实时版,代价是续航(内置电池计量,`battreport` 外推)
 - **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字开赛时刻,替代日常信息密集的仪表盘;周末里排位赛/冲刺赛结束后**渐进**补出对应赛果(Top 5),正赛前信息更有用;赛程剩余 >3 天时自动回到仪表盘
-- **屏保内容(仪表盘)**:下一场比赛(开赛时刻板)、赛季进度刻度尺、车手积分榜 Top 10 与车队积分榜 Top 10(第 2 名起灰字标落后差距)、上场比赛领奖台 Top 3、下一场赛道轮廓图、赛车头盔图标与 F1 官方徽标
+- **屏保内容(仪表盘)**:大字标题条(左上角小牌显示更新时刻,北京时间)、车手/车队积分榜 Top 5(点线引导)、下一场比赛面板(赛名、轮次、反色开赛时刻条、赛道轮廓图)、上场比赛领奖台 Top 3、底部资讯盒三联(杭州每日天气 / 巴萨下一场 LaLiga + 榜位 / GitHub Trending 今日第一仓)
 - **刷新屏保**:KUAL 里一键 Refresh Now(下载云端成图,秒级)
 - **自动刷新**:清醒时每 30 分钟刷新一次
 - **局部降级**:任一数据接口失败只影响对应区块(显示 no data),页面整体存活;云端主数据源失败时保留上一张成功图,Kindle 端不做本机渲染
@@ -92,6 +93,8 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 | 场景 | 操作 |
 |---|---|
 | 当信息牌摆着 | KUAL → **Start Service** → **Auto Sleep 切到 ON** → 按电源键休眠,屏保显示面板;之后按一下电源键,它自己拉新图并回睡,锁屏始终最新 |
+| 全天候信息牌 | KUAL → **Always On 切到 ON**:设备自动停掉 framework + pillow(纯净全屏,无状态栏/对话框),每小时开 Wi-Fi(wifid)拉图 eips 全屏重显示后关 Wi-Fi;**运行中 KUAL 不可用**,恢复阅读跑 `ssh kindle /mnt/us/extensions/f1/bin/always_on_stop.sh`(自动拉回 framework+pillow)或直接重启 Kindle |
+| 看常显续航 | 设备在线时 `ssh kindle "/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py battreport"`(采样 CSV 在 `/mnt/us/f1dash/battery.csv`;每小时刷新的 Wi-Fi 窗口内可连) |
 | 正常阅读 | KUAL → **Auto Sleep 切到 OFF**,唤醒后不再自动回睡 |
 | 立即刷新屏保 | KUAL → **Refresh Now**(优先拉云端成图,下次休眠显示新图) |
 | 停用服务 | KUAL → **Stop Service** |
@@ -126,7 +129,7 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 │   ├── make_icon.py      # 开发机专用:MDI 头盔图标 SVG → f1icon.json
 │   └── make_logo.py      # 开发机专用:F1 官方徽标 SVG → f1logo.json
 └── kindle/
-    ├── f1dash.py         # 主程序:png / pull / refresh / service 四模式
+    ├── f1dash.py         # 主程序:png / pull / refresh / service / alwayson / battreport 六模式
     ├── tracks.json       # 赛道轮廓坐标(F1DB,CC BY 4.0)
     ├── f1icon.json       # 页眉头盔图标坐标(MDI racing-helmet,Apache 2.0)
     ├── f1logo.json       # F1 官方徽标坐标(Wikimedia Commons,Public domain)
@@ -134,8 +137,8 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
     ├── make_ss_test.py   # 屏保定位测试图生成器
     └── extensions/f1/    # KUAL 插件,部署到 /mnt/us/extensions/f1/
         ├── config.xml    # 扩展注册(必需)
-        ├── menu.json     # 菜单定义(含 Auto Sleep 开关)
-        └── bin/          # refresh / autosleep_toggle / start / stop 脚本
+        ├── menu.json     # 菜单定义(含 Auto Sleep / Always On 开关)
+        └── bin/          # refresh / autosleep_toggle / always_on_* / start / stop 脚本
 ```
 
 ## 技术要点
@@ -152,4 +155,17 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
   赛道名/开赛时刻用 `_fit()` 动态缩字,任何赛道名(如 "United States Grand Prix")都不会溢出
 - 本设备(PW1 5.6.1.1)外部 RTC 闹钟无法唤醒挂起内核,故不做"休眠中定时刷新";
   设备睡着时云端图再新也刷不上去,这是硬件上限(详见 docs §6.4)
+- **常显模式设备事实(实测)**:`preventScreenSaver`(rw)置 1 阻止入睡,本固件无
+  `suspendScreenSaver`/`batLevel`;前光是 `flIntensity`/`flAuto`;eips 不在默认 PATH,
+  在 `/usr/sbin/eips`(`-g` 解析 PNG,`-f` 是全刷非全屏,且必须放在图片路径之后);
+  电池走 `yoshi_battery0` 电芯计量(`battery_mAH`/`battery_lmd`=真实满容量/
+  battery_voltage=mV),电流原始单位不明,续航一律用 mAH 衰减速率外推;
+  `battreport` 同时检测采样空洞(>5 分钟区分进程重启与挂起)
+- **纯净全屏三件套(实测)**:①停 framework —— 但 `com.lab126.cmd wirelessEnable`
+  就是 framework 提供的(一调就弹飞行模式对话框,框架死了无人响应);②Wi-Fi 开关
+  改走 `com.lab126.wifid enable`(独立守护,框架生死都可用,已实测);③只停 framework
+  不够 —— `pillowd`(状态栏/对话框渲染进程)还在跑、时钟仍会盖屏,`stop pillow`
+  也要执行。恢复 = `start framework` + `start pillow`。方案参照
+  [paperwhite-weather](https://github.com/estcarisimo/paperwhite-weather)(其
+  DEVICE.md 实测:停框架后 Wi-Fi 保持连接、贴图 15 分钟无人覆盖,功耗约 1.3%/h)
 - 详见 [`docs/项目说明.md`](docs/项目说明.md) §6 踩坑记录

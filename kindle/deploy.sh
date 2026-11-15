@@ -14,6 +14,9 @@ scp -q kindle/extensions/f1/menu.json               "$HOST:/mnt/us/extensions/f1
 scp -q kindle/extensions/f1/bin/refresh.sh          "$HOST:/mnt/us/extensions/f1/bin/refresh.sh"
 scp -q kindle/extensions/f1/bin/start.sh            "$HOST:/mnt/us/extensions/f1/bin/start.sh"
 scp -q kindle/extensions/f1/bin/autosleep_toggle.sh "$HOST:/mnt/us/extensions/f1/bin/autosleep_toggle.sh"
+scp -q kindle/extensions/f1/bin/always_on_start.sh  "$HOST:/mnt/us/extensions/f1/bin/always_on_start.sh"
+scp -q kindle/extensions/f1/bin/always_on_stop.sh   "$HOST:/mnt/us/extensions/f1/bin/always_on_stop.sh"
+scp -q kindle/extensions/f1/bin/always_on_toggle.sh "$HOST:/mnt/us/extensions/f1/bin/always_on_toggle.sh"
 ssh "$HOST" "chmod +x /mnt/us/extensions/f1/bin/*.sh"
 
 echo "==> 重启守护进程(启动即拉一次云端图刷新屏保)"
