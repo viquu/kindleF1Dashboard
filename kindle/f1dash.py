@@ -888,7 +888,8 @@ def _draw_dashboard(d, data, font, text):
     text(360, 35, "DASHBOARD", font(True, _fit(d, font, "DASHBOARD", 424, 40)),
          anchor="mm")
     d.rectangle([fs(18), fy(8), fs(90) - 1, fy(32) - 1], outline=0, width=lw(2))
-    _text_tracked(d, font, 54, 14, data["upd_stamp"], 8, anchor="ma", track=1)
+    _text_tracked(d, font, 54, 14, data["upd_stamp"], 9, bold=True,
+                  anchor="ma", track=1)
 
     # 双积分榜 Top 5:标签牌 + 行列(无外框,点线引导)
     for x0, x1, label, rows in (
