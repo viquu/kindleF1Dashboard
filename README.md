@@ -93,8 +93,8 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 | 场景 | 操作 |
 |---|---|
 | 当信息牌摆着 | KUAL → **Start Service** → **Auto Sleep 切到 ON** → 按电源键休眠,屏保显示面板;之后按一下电源键,它自己拉新图并回睡,锁屏始终最新 |
-| 全天候信息牌 | KUAL → **Always On 切到 ON**:设备自动停掉 framework + pillow(纯净全屏,无状态栏/对话框),每小时开 Wi-Fi(wifid)拉图 eips 全屏重显示后关 Wi-Fi;**运行中 KUAL 不可用**,恢复阅读跑 `ssh kindle /mnt/us/extensions/f1/bin/always_on_stop.sh`(自动拉回 framework+pillow)或直接重启 Kindle |
-| 看电量/续航 | 常显屏右下角角标(每小时随刷新更新,含实测外推续航);想看完整报表再 `ssh kindle "/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py battreport"`(采样 CSV 在 `/mnt/us/f1dash/battery.csv`;每小时刷新的 Wi-Fi 窗口内可连) |
+| 全天候信息牌 | KUAL → **Always On 切到 ON**:设备自动停掉 framework + pillow(纯净全屏,无状态栏/对话框),每小时拉图,成图或电量有变才 eips 全屏重显示;Wi-Fi 常开不关(实测软关无效,见 f1dash.py `wifi()`)。**运行中 KUAL 不可用**,恢复阅读跑 `ssh kindle /mnt/us/extensions/f1/bin/always_on_stop.sh`(自动拉回 framework+pillow)或直接重启 Kindle |
+| 看电量/续航 | 常显屏右下角角标(成图或电量变化刷新时更新,含实测外推续航);想看完整报表再 `ssh kindle "/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py battreport"`(采样 CSV 在 `/mnt/us/f1dash/battery.csv`;Wi-Fi 常开,SSH 随时可连) |
 | 正常阅读 | KUAL → **Auto Sleep 切到 OFF**,唤醒后不再自动回睡 |
 | 立即刷新屏保 | KUAL → **Refresh Now**(优先拉云端成图,下次休眠显示新图) |
 | 停用服务 | KUAL → **Stop Service** |

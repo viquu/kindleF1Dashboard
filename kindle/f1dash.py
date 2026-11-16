@@ -808,21 +808,21 @@ def _ellipsize(d, font, s, max_w, size, bold=False):
     return s + "..."
 
 
-def _standings_rows(d, font, text, x0, x1, rows, y0, step=26):
+def _standings_rows(d, font, text, x0, x1, rows, y0, step=28):
     """积分榜 Top 5:名次 + 大写名 + 点线引导 + 右对齐积分(全黑,报纸语法)。"""
     ry = y0
     for pos, name, val in rows[:5]:
         name, val = str(name), str(val)
         text(x0, ry, str(pos), font(True, 13), anchor="lm")
-        text(x0 + 34, ry, name, font(True, 15), anchor="lm")
-        nw = d.textlength(name, font=font(True, 15)) / (FULL_SCALE * AA_SCALE)
-        pw = d.textlength(val, font=font(True, 15)) / (FULL_SCALE * AA_SCALE)
+        text(x0 + 34, ry, name, font(True, 17), anchor="lm")
+        nw = d.textlength(name, font=font(True, 17)) / (FULL_SCALE * AA_SCALE)
+        pw = d.textlength(val, font=font(True, 17)) / (FULL_SCALE * AA_SCALE)
         _dots(d, x0 + 34 + nw + 8, x1 - 8 - pw - 8, ry)
-        text(x1 - 8, ry, val, font(True, 15), anchor="rm")
+        text(x1 - 8, ry, val, font(True, 17), anchor="rm")
         ry += step
 
 
-def _info_box(d, font, text, x0, x1, title, lines, note=None, y0=620, y1=778):
+def _info_box(d, font, text, x0, x1, title, lines, y0=620, y1=778):
     """底部资讯盒:居中标题 + 下划线 + '- ' 行列(天气/巴萨/Trending 共用)。"""
     cx = (x0 + x1) / 2
     d.rectangle([fs(x0), fy(y0), fs(x1) - 1, fy(y1) - 1], outline=0, width=lw(2))
@@ -836,8 +836,6 @@ def _info_box(d, font, text, x0, x1, title, lines, note=None, y0=620, y1=778):
             # 加粗:12px 常规体在 e-ink 上笔画太细,发虚难读
             text(x0 + 12, ly, "- %s" % s, font(True, 12))
         ly += 24
-    if note:
-        _text_tracked(d, font, cx, y1 - 16, note, 7, fill=GRAY_LABEL, anchor="ma")
 
 
 def _draw_info_boxes(d, data, font, text):
@@ -852,7 +850,7 @@ def _draw_info_boxes(d, data, font, text):
                   "%s%s" % (today["text"], rain),
                   "Tomorrow %s %d°C" % (tom["text"], tom["high"])]
     _info_box(d, font, text, 28, 206, "%s TODAY" % (w["city"] if w else "WEATHER"),
-              wlines, note="daily forecast — not current temp")
+              wlines)
 
     blines = []
     if b:
@@ -930,7 +928,7 @@ def _draw_dashboard(d, data, font, text):
                or nr["Circuit"].get("circuitId") or "").replace("_", " ").upper()
         _text_tracked(d, font, 468, 434, cap,
                       _fit(d, font, cap, 176, 9, bold=False, min_size=7),
-                      fill=GRAY_LABEL, anchor="ma", track=1)
+                      fill=0, anchor="ma", track=1)
 
     # LAST RACE 领奖台三栏
     d.rectangle([fs(28), fy(484), fs(572) - 1, fy(606) - 1], outline=0, width=lw(2))
@@ -958,12 +956,12 @@ def _poster_footer(d, data, font, text, nr):
     """海报区之下:SEASON·ROUND + 进度刻度(同一基线) + 共用页脚。"""
     done, total = data["progress"] or (0, 0)
     _text_tracked(d, font, 28, 694, "SEASON %s · ROUND %s" % (data["season"], nr["round"]),
-                  15, fill=GRAY_INK2, track=2)
+                  15, fill=0, track=2)
     _season_ruler(d, 400, 520, 701, done, total, tick_w=3, tick_h=8)
-    text(572, 698, "%d/%d" % (done, total), font(False, 14), fill=GRAY_LABEL, anchor="ra")
+    text(572, 698, "%d/%d" % (done, total), font(False, 14), fill=0, anchor="ra")
     d.line([fs(28), fy(768), fs(572), fy(768)], fill=GRAY_SOFT, width=lw(1))
     _text_tracked(d, font, 28, 776, "LAST UPDATE %s" % data["upd"], 12,
-                  fill=GRAY_LABEL, track=1)
+                  fill=0, track=1)
 
 
 def _draw_poster(d, data, font, text):
@@ -998,7 +996,7 @@ def _draw_poster(d, data, font, text):
     # 标签锚 y(505)大于数字锚 y(489)是正常的——数字用 ma 锚,glyph 顶在锚下 ~46px
     rnd = nr.get("round", "")
     if rnd:
-        _text_tracked(d, font, 300, 497, "ROUND", 12, fill=140, anchor="ma", track=4)
+        _text_tracked(d, font, 300, 497, "ROUND", 12, fill=255, anchor="ma", track=4)
         text(300, 489, rnd, font(True, _fit(d, font, rnd, 420, 135)), fill=0,
              anchor="ma", stroke_width=lw(3), stroke_fill=255)
     _poster_footer(d, data, font, text, nr)
@@ -1024,13 +1022,16 @@ def _draw_poster_results(d, data, font, text, nr):
     y = 300
     for b in data["poster_sessions"]:
         _text_tracked(d, font, 48, y, b["label"], 14, fill=255, track=3)
-        d.line([fs(48), fy(y + 24), fs(552), fy(y + 24)], fill=110, width=lw(1))
+        # lw(1) 细线经 4x→1x 缩回后常跨两个输出行,LANCZOS 摊薄到 ~127 灰会被
+        # 1-bit 阈值吃掉( QUALIFYING 线实测消失);lw(2) 与资讯盒分隔线同宽,必现。
+        d.line([fs(48), fy(y + 24), fs(552), fy(y + 24)], fill=255, width=lw(2))
         yy = y + 38
         for pos, name, val in b["rows"]:
             lead = pos == "1"
-            text(48, yy, pos, font(lead, 15), fill=255 if lead else 180, anchor="lm")
+            # 灰阶(180/210/240)在 e-ink 上量化发虚,一律纯白,P1 层级靠加粗区分
+            text(48, yy, pos, font(lead, 15), fill=255, anchor="lm")
             text(84, yy, surname(name), font(lead, 17), fill=255, anchor="lm")
-            text(552, yy, val, font(lead, 15), fill=240 if lead else 210, anchor="rm")
+            text(552, yy, val, font(lead, 15), fill=255, anchor="rm")
             yy += 28
         y = yy + 16
 
@@ -1075,6 +1076,10 @@ def png_render(data, out=SS_OUT):
         _draw_dashboard(d, data, font, text)
 
     img = img.resize(SS_SIZE, Image.LANCZOS)
+    # 1-bit 化:LANCZOS 缩回会把细笔画混成中灰,eips 对灰阶的量化不可预测;
+    # 硬阈值(>160 视为白)出纯黑白 758x1024,笔画实心不发虚。0/255 输入下
+    # convert("1") 的抖动不产生任何误差,安全。
+    img = img.point(lambda p: 255 if p > 160 else 0).convert("1")
     img.save(out)
     print("saved:", out, img.size, img.mode)
     return True
@@ -1160,9 +1165,9 @@ def service_mode():
 
 # ---------------- 常显模式(always-on) ----------------
 #
-# 与 service 模式互补的信息牌形态:设备永不入睡,每小时开 Wi-Fi 拉一次成图,
-# eips 直接全屏显示后关 Wi-Fi。PW1 的 RTC 闹钟无法从挂起唤醒内核(见文件头),
-# 睡着就刷不了;常显等于用续航换全天候实时。
+# 与 service 模式互补的信息牌形态:设备永不入睡,每小时拉一次成图(Wi-Fi 常开
+# 不关,见 wifi()),成图或电量角标有变才 eips 全屏重显示。PW1 的 RTC 闹钟
+# 无法从挂起唤醒内核(见文件头),睡着就刷不了;常显等于用续航换全天候实时。
 # 前置光始终关闭 —— 常显模式下它是最大的单一耗电源。
 # 循环内每轮重申防入睡标志并重试熄灯,防框架重置。
 
@@ -1172,7 +1177,7 @@ BADGE_STRIP_H = 26                         # 底部白边高度(画布物理像�
 LOW_BATT_PCT = 15                          # 电量不高于此值时顶部加黑底警告条
 BATT_SYSFS = "/sys/devices/system/yoshi_battery/yoshi_battery0"
 BATT_LOG = "/mnt/us/f1dash/battery.csv"    # 电池采样 CSV(battreport 消费)
-BATT_SAMPLE = 60                           # 采样周期:电芯计量更新缓慢,秒级无意义
+BATT_SAMPLE = 300                          # 采样周期:电芯计量更新缓慢,5 分钟足够,省去无谓的 lipc/sysfs 读与 CSV 追加
 
 
 def _sysfs_int(name):
@@ -1430,16 +1435,31 @@ def overlay_battery(src=SS_OUT, dst=ALWAYS_OUT, status=None):
         return False
 
 
+def _read_bytes(path):
+    """整读文件字节;缺失/异常返回 None(always_cycle 比对成图是否变化用)。"""
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+_last_shown_pct = None   # 上一轮真正刷上屏的角标电量 %(None = 尚未显示过)
+
+
 def always_cycle():
-    """一轮常显刷新:确保 Wi-Fi → 拉图 → 叠加电量角标 → 全屏显示。
+    """一轮常显刷新:确保 Wi-Fi → 拉图 → 图/电量有变才叠加角标并全屏显示。
 
     云端原图只进 SS_OUT(锁屏图保持干净,framework 活着时状态栏自有电量),
     eips 显示图由 overlay_battery 从 SS_OUT 现算:即使拉图失败,角标上的
-    电量/续航也随每轮更新。无干净源时兜底显示旧显示图,屏面始终有内容。
+    电量/续航也随每轮更新。eips -f 是整屏翻转,成图没变(pull_image 对相同
+    字节不写盘,比对前后内容即知)且角标电量没变时跳过全刷,静等下一轮。
     """
+    global _last_shown_pct
     t0 = time.time()
     wifi(True)
     net = wait_network()
+    prev = _read_bytes(SS_OUT)
     pulled = False
     if net:
         pulled = pull_image(outs=(SS_OUT,))
@@ -1447,17 +1467,25 @@ def always_cycle():
             log("cycle: pull failed; keep last image")
     else:
         log("cycle: no network; keep last image")
-    shown = None
-    if os.path.exists(SS_OUT):
-        shown = ALWAYS_OUT if overlay_battery() else SS_OUT
-    elif os.path.exists(ALWAYS_OUT):
-        shown = ALWAYS_OUT
-    if shown:
-        show_fullscreen(shown)
-    wifi(False)
-    cap = _sysfs_raw("battery_capacity") or "?"
+    image_changed = _read_bytes(SS_OUT) != prev
+    cap = _sysfs_raw("battery_capacity")
+    try:
+        pct = int(cap.rstrip("%"))
+    except ValueError:
+        pct = None
+    if image_changed or (pct is not None and pct != _last_shown_pct):
+        shown = None
+        if os.path.exists(SS_OUT):
+            shown = ALWAYS_OUT if overlay_battery() else SS_OUT
+        elif os.path.exists(ALWAYS_OUT):
+            shown = ALWAYS_OUT
+        if shown:
+            show_fullscreen(shown)
+            _last_shown_pct = pct
+    else:
+        log("cycle: image and battery unchanged; skip eips refresh")
     log("cycle done in %ds: net=%s pull=%s battery %s"
-        % (time.time() - t0, net, pulled, cap))
+        % (time.time() - t0, net, pulled, cap or "?"))
 
 
 def daemonize():
@@ -1636,7 +1664,7 @@ def battreport(path=BATT_LOG):
     """汇总电池采样 CSV:放电速率、平均功率、外推续航,并检测入睡空洞。
 
     放电速率用 battery_mAH 随时间衰减计算(不依赖电流原始单位,插电行剔除);
-    行间空洞 >5 分钟视为发生过挂起(常显模式不该出现),显式列出。
+    行间空洞 >1.5× 采样周期视为发生过挂起(常显模式不该出现),显式列出。
     """
     rows, restarts = batt_rows(path)
     if not rows:
@@ -1651,8 +1679,9 @@ def battreport(path=BATT_LOG):
              (rows[-1]["ts"] - rows[0]["ts"]) / 3600.0, len(rows),
              sum(1 for r in rows if not r["chg"])))
 
+    gap_limit = BATT_SAMPLE * 1.5   # 正常行距 ~BATT_SAMPLE(读数开销另加),超 1.5 倍才算挂起空洞
     gaps = [(rows[i - 1]["ts"], rows[i]["ts"]) for i in range(1, len(rows))
-            if rows[i]["ts"] - rows[i - 1]["ts"] > 300]
+            if rows[i]["ts"] - rows[i - 1]["ts"] > gap_limit]
     slept = False
     for g0, g1 in gaps:
         if any(g0 < rts <= g1 for rts in restarts):
