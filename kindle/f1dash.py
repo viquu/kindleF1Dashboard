@@ -1178,6 +1178,9 @@ LOW_BATT_PCT = 15                          # 电量不高于此值时顶部加�
 BATT_SYSFS = "/sys/devices/system/yoshi_battery/yoshi_battery0"
 BATT_LOG = "/mnt/us/f1dash/battery.csv"    # 电池采样 CSV(battreport 消费)
 BATT_SAMPLE = 300                          # 采样周期:电芯计量更新缓慢,5 分钟足够,省去无谓的 lipc/sysfs 读与 CSV 追加
+FL_SYSFS = "/sys/devices/system/fl_tps6116x/fl_tps6116x0/fl_intensity"
+# 前光硬件档位(0-254):唯一能真写 0 的口。cat 返回 'FrontLight(Intensity) = N'
+# 非纯整数;lipc flIntensity 0 只是把 UI 档钳到硬件 1(假灭,LED 仍微亮)
 
 
 def _sysfs_int(name):
@@ -1211,18 +1214,66 @@ def keep_awake(on=True):
         log("keep_awake(%s) failed: %r" % (on, exc))
 
 
-def front_light_off():
-    """熄灭前置光(powerd flIntensity/flAuto,本机实测属性名)。
+def _fl_sysfs_level():
+    """读前光硬件档位;节点值是 'FrontLight(Intensity) = N' 非纯整数,取尾部数字。
 
-    每轮循环重试,常态下漏关的可能性被压到最低;失败仅记日志不影响刷新。
+    缺失/异常返回 None。lipc 读回对硬件状态撒谎(lipc 0 硬件 1),以这里为准。
     """
     try:
-        subprocess.run(["lipc-set-prop", "com.lab126.powerd", "flIntensity", "0"],
-                       capture_output=True, timeout=5)
-        subprocess.run(["lipc-set-prop", "com.lab126.powerd", "flAuto", "0"],
-                       capture_output=True, timeout=5)
+        with open(FL_SYSFS) as f:
+            m = re.search(r"(\d+)\s*$", f.read())
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
+def front_light_off():
+    """熄灭前置光:lipc + sysfs 双层,顺序与时机都不能错(PW1 5.6.1.1 实测)。
+
+    lipc flIntensity 0 不是真灭——powerd 把 UI 0 钳到硬件最低亮档 1(KOReader
+    对 KPW1 标 canTurnFrontlightOff=no),lipc 读回 0 而 LED 仍微亮;能写 0 的
+    只有 fl_tps6116x sysfs。顺序:先 lipc 后 sysfs(先 sysfs 会被 powerd 落硬件
+    时覆回 1),sleep 2 等落定;framework 停机会重套滑块值,故必须在停框架之后
+    执行(调用方保证),且每次绘制后再重申。写 0 用裸 "0" 不带换行。读回以
+    sysfs 尾部数字为准,未归零记 warning。
+    """
+    rc_auto = rc_int = -1
+    errs = []
+    try:
+        for prop in ("flAuto", "flIntensity"):
+            r = subprocess.run(["lipc-set-prop", "-i", "com.lab126.powerd",
+                                prop, "0"], capture_output=True, text=True,
+                               timeout=5)
+            if prop == "flAuto":
+                rc_auto = r.returncode
+            else:
+                rc_int = r.returncode
+            if r.returncode != 0 and r.stderr:
+                errs.append("%s: %s" % (prop, r.stderr.strip()))
+        time.sleep(2)       # powerd 把 lipc 0 落硬件(钳到 1)后再压 sysfs
+        with open(FL_SYSFS, "w") as f:
+            f.write("0")    # 裸 0 不带换行;print() 会补换行,不用
     except Exception as exc:
-        log("front light off failed: %r" % exc)
+        log("front light off failed: lipc rc=%d/%d %s %r"
+            % (rc_auto, rc_int, "; ".join(errs), exc))
+        return
+    hw = _fl_sysfs_level()
+    lip = {}
+    for prop in ("flIntensity", "flRawIntensity"):
+        try:
+            r = subprocess.run(["lipc-get-prop", "com.lab126.powerd", prop],
+                               capture_output=True, text=True, timeout=5)
+            lip[prop] = r.stdout.strip() if r.returncode == 0 else "n/a"
+        except Exception:
+            lip[prop] = "n/a"   # flRawIntensity 本机 FW 不存在,按 n/a 记
+    if hw == 0:
+        log("front light off: hw=0 lipc flIntensity=%s flRawIntensity=%s rc=%d/%d"
+            % (lip["flIntensity"], lip["flRawIntensity"], rc_auto, rc_int))
+    else:
+        log("warning: front light NOT off (hw=%s) lipc flIntensity=%s "
+            "flRawIntensity=%s rc=%d/%d %s"
+            % (hw, lip["flIntensity"], lip["flRawIntensity"],
+               rc_auto, rc_int, "; ".join(errs)))
 
 
 def is_charging():
@@ -1482,6 +1533,7 @@ def always_cycle():
         if shown:
             show_fullscreen(shown)
             _last_shown_pct = pct
+            front_light_off()   # 绘制/eips 后重申:单次熄灯是已知脆弱模式,会爬回 1
     else:
         log("cycle: image and battery unchanged; skip eips refresh")
     log("cycle done in %ds: net=%s pull=%s battery %s"
@@ -1524,11 +1576,11 @@ def always_on_mode(interval=None):
     log("always-on started (interval %ds, pid %d)" % (interval, os.getpid()))
     BatteryMeter().start()
     keep_awake(True)
-    front_light_off()
     if framework_stop():
         log("framework stopped; screen is ours alone")
     else:
         log("warning: framework stop failed; chrome may repaint over the image")
+    front_light_off()   # 停框架之后:停机会重套滑块亮度,先停再灭
     always_cycle()
     while True:
         t0 = time.time()
@@ -1537,9 +1589,9 @@ def always_on_mode(interval=None):
         if elapsed > interval + 120:
             log("warning: %ds gap in loop — system suspended?" % round(elapsed))
         keep_awake(True)
-        front_light_off()
         if framework_ensure_stopped():
             log("framework respawned; stopped it again")
+        front_light_off()
         always_cycle()
 
 
