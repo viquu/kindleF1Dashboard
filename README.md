@@ -157,7 +157,8 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
   设备睡着时云端图再新也刷不上去,这是硬件上限(详见 docs §6.4)
 - **常显模式设备事实(实测)**:`preventScreenSaver`(rw)置 1 阻止入睡,本固件无
   `suspendScreenSaver`/`batLevel`;前光是 `flIntensity`/`flAuto`;eips 不在默认 PATH,
-  在 `/usr/sbin/eips`(`-g` 解析 PNG,`-f` 是全刷非全屏,且必须放在图片路径之后);
+  在 `/usr/sbin/eips`(`-g` 解析 PNG 且路径须紧跟其后;`-g -f` 只是 "full update",
+  实测清不掉残影,整屏 flash 须 `eips -s w=758,h=1024 -f` 以当前 fb 内容闪翻全屏);
   电池走 `yoshi_battery0` 电芯计量(`battery_mAH`/`battery_lmd`=真实满容量/
   battery_voltage=mV),电流原始单位不明,续航一律用 mAH 衰减速率外推;
   `battreport` 同时检测采样空洞(>5 分钟区分进程重启与挂起)

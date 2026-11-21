@@ -1386,21 +1386,34 @@ def wait_network(timeout=60):
     return False
 
 
-def show_fullscreen(path=ALWAYS_OUT):
-    """eips 显示成图:-g 解析 PNG,-f 全刷清残影;758x1024 原图无需缩放定位。
+def show_fullscreen(path=ALWAYS_OUT, flash=True):
+    """eips 显示成图:758x1024 原图无需缩放定位;eips 不在 PATH(/usr/sbin)。
 
-    本机 eips 把第一个非旗标参数当图片路径,-f 必须放在路径之后
-    (`eips -g <path> -f`,实测 `eips -g -f <path>` 会去 fopen "-f" 报 rc=1);
-    eips 不在默认 PATH(/usr/sbin),必须用绝对路径。
+    PW1 实测(2026-11-21 排位赛成图更新后旧图痕迹仍在):`-g -f` 只是
+    "full update",并不能整屏翻转清残影;清残影必须用 usage 明示的整屏
+    flash `eips -s w=758,h=1024 -f`(以当前 fb 内容闪翻全屏,rc=0 已验证)。
+    flash=True(成图有变)先 -g 绘制再补整屏 flash;flash=False(仅电量
+    角标变)沿用 -g -f 重绘,不额外闪屏。本机 eips 把第一个非旗标参数当
+    图片路径,路径必须紧跟 -g。
     """
     try:
-        r = subprocess.run(["/usr/sbin/eips", "-g", path, "-f"],
+        if flash:
+            r = subprocess.run(["/usr/sbin/eips", "-g", path],
+                               capture_output=True, timeout=30)
+            if r.returncode != 0:
+                log("eips rc=%d %s; skip fullscreen flash"
+                    % (r.returncode, r.stderr[:60]))
+                return
+            subprocess.run(["/usr/sbin/eips", "-s", "w=758,h=1024", "-f"],
                            capture_output=True, timeout=30)
-        if r.returncode != 0:
-            log("eips rc=%d %s; fallback partial update"
-                % (r.returncode, r.stderr[:60]))
-            subprocess.run(["/usr/sbin/eips", "-g", path],
-                           capture_output=True, timeout=30)
+        else:
+            r = subprocess.run(["/usr/sbin/eips", "-g", path, "-f"],
+                               capture_output=True, timeout=30)
+            if r.returncode != 0:
+                log("eips rc=%d %s; fallback partial update"
+                    % (r.returncode, r.stderr[:60]))
+                subprocess.run(["/usr/sbin/eips", "-g", path],
+                               capture_output=True, timeout=30)
     except Exception as exc:
         log("show failed: %r" % exc)
 
@@ -1587,8 +1600,9 @@ def always_cycle():
     小时循环里;末尾记录 wlan0 当前 IP,下次 SSH 失联可先分辨是不是 DHCP 换址。
     云端原图只进 SS_OUT(锁屏图保持干净,framework 活着时状态栏自有电量),
     eips 显示图由 overlay_battery 从 SS_OUT 现算:即使拉图失败,角标上的
-    电量/续航也随每轮更新。eips -f 是整屏翻转,成图没变(pull_image 对相同
-    字节不写盘,比对前后内容即知)且角标电量没变时跳过全刷,静等下一轮。
+    电量/续航也随每轮更新。成图没变(pull_image 对相同字节不写盘,比对前后
+    内容即知)且角标电量没变时跳过重显,静等下一轮;成图有变走整屏 flash
+    清残影(-g -f 的 full update 实测清不掉,见 show_fullscreen)。
     """
     global _last_shown_pct
     t0 = time.time()
@@ -1616,7 +1630,9 @@ def always_cycle():
         elif os.path.exists(ALWAYS_OUT):
             shown = ALWAYS_OUT
         if shown:
-            show_fullscreen(shown)
+            show_fullscreen(shown, flash=image_changed)   # 成图有变才整屏 flash 清残影
+            if image_changed:
+                log("cycle: image changed; refresh with fullscreen flash")
             _last_shown_pct = pct
             front_light_off()   # 绘制/eips 后重申:单次熄灯是已知脆弱模式,会爬回 1
     else:
