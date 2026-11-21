@@ -1498,9 +1498,93 @@ def _read_bytes(path):
 _last_shown_pct = None   # 上一轮真正刷上屏的角标电量 %(None = 尚未显示过)
 
 
-def always_cycle():
-    """一轮常显刷新:确保 Wi-Fi → 拉图 → 图/电量有变才叠加角标并全屏显示。
+# ---------------- dropbear 看门狗(SSH 入站失联自愈) ----------------
 
+DROPBEAR_BIN = "/usr/bin/dropbear"                # usbnet 包软链 → bin/dropbearmulti(libkh5 SSH_DAEMON)
+DROPBEAR_PIDFILE = "/mnt/us/usbnet/run/sshd.pid"  # libkh5 SSH_PID
+DROPBEAR_OPTS = ["-P", DROPBEAR_PIDFILE, "-K", "15"]  # libkh5 SSH_DAEMON_OPTS
+# 本机 usbnet config 为 USE_WIFI=true / QUIET_DROPBEAR=false / USE_OPENSSH=false,
+# 不再附加 -n/-b,故上述三项即开机 usbnet 脚本启动 dropbear 的完整参数。
+START_STOP_DAEMON = "/sbin/start-stop-daemon"
+
+
+def _dropbear_listener_pid():
+    """活着的 dropbear 监听进程 pid(按 pidfile 校验);没有则 None。
+
+    不能扫 /proc 找 dropbear:监听进程与每个 SSH 连接子进程的 cmdline 完全
+    相同,监听死后旧连接子进程仍活着,会误判成"服务还在"——这正是 SSH
+    "连不上但会话在"的病灶。监听进程是 pidfile 的唯一写入者,按
+    libkh5/start-stop-daemon 同款机制校验:pid 存在且 cmdline 是 dropbear
+    才算活(顺带排除 pid 复用)。
+    """
+    try:
+        with open(DROPBEAR_PIDFILE) as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return None
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            cmd = f.read().replace(b"\0", b" ")
+    except Exception:
+        return None
+    return pid if b"dropbear" in cmd else None
+
+
+def dropbear_watchdog():
+    """每小时巡检 dropbear(SSH 入站):活着只记一行,死了按 usbnet 原装方式拉起。
+
+    背景:常显模式下出站拉图正常、SSH 数小时后失联,dropbear 被杀(OOM/框架
+    重启误伤)无从知晓,而 KUAL 在常显下不可用,只能由本守护自查自愈。
+    重启命令与 /mnt/us/usbnet/bin/usbnetwork 对 sshd 的启动完全一致
+    (start-stop-daemon -q -p <pidfile> -x /usr/bin/dropbear -S -- -P <pidfile>
+    -K 15);不跑整个 usbnetwork,它会切换 USB 网络模式并重配 Wi-Fi,副作用太大。
+    """
+    pid = _dropbear_listener_pid()
+    if pid:
+        log("dropbear alive (pid %d)" % pid)
+        return
+    try:   # 残留死 pid 的 pidfile:usbnet 脚本同款处理,清掉再拉起
+        os.remove(DROPBEAR_PIDFILE)
+    except OSError:
+        pass
+    if not os.access(DROPBEAR_BIN, os.X_OK):
+        try:   # usbnetwork 同款兜底(软链目标在 /mnt/us,权限可能随包丢失)
+            os.chmod(DROPBEAR_BIN, 0o755)
+        except Exception as exc:
+            log("dropbear chmod failed: %r" % exc)
+    try:
+        subprocess.run([START_STOP_DAEMON, "-q", "-p", DROPBEAR_PIDFILE,
+                        "-x", DROPBEAR_BIN, "-S", "--"] + DROPBEAR_OPTS,
+                       capture_output=True, timeout=10)
+    except Exception as exc:
+        log("dropbear missing, restart error: %r" % exc)
+    time.sleep(2)   # dropbear 自守护,等 pidfile/proc 就绪再验证
+    pid = _dropbear_listener_pid()
+    if pid:
+        log("dropbear missing, restarted (pid %d)" % pid)
+    else:
+        log("dropbear missing, restart FAILED; SSH stays down until next check")
+
+
+def current_ip():
+    """wlan0 当前 IPv4(解析 /sbin/ifconfig 输出;不在 PATH 须绝对路径)。
+
+    不用 hostname -I:PW1 的 busybox 版本不支持 -I;无 IP(未关联)返回 None。
+    """
+    try:
+        out = subprocess.run([IFCONFIG, WLAN_IF], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return None
+    m = re.search(r"inet addr:((\d+\.){3}\d+)", out)
+    return m.group(1) if m else None
+
+
+def always_cycle():
+    """一轮常显刷新:巡检 dropbear → 确保 Wi-Fi → 拉图 → 图/电量有变才叠加角标并全屏显示。
+
+    开头先巡检 dropbear(SSH 入站自愈,见 dropbear_watchdog),与拉图同在一个
+    小时循环里;末尾记录 wlan0 当前 IP,下次 SSH 失联可先分辨是不是 DHCP 换址。
     云端原图只进 SS_OUT(锁屏图保持干净,framework 活着时状态栏自有电量),
     eips 显示图由 overlay_battery 从 SS_OUT 现算:即使拉图失败,角标上的
     电量/续航也随每轮更新。eips -f 是整屏翻转,成图没变(pull_image 对相同
@@ -1508,6 +1592,7 @@ def always_cycle():
     """
     global _last_shown_pct
     t0 = time.time()
+    dropbear_watchdog()
     wifi(True)
     net = wait_network()
     prev = _read_bytes(SS_OUT)
@@ -1538,6 +1623,7 @@ def always_cycle():
         log("cycle: image and battery unchanged; skip eips refresh")
     log("cycle done in %ds: net=%s pull=%s battery %s"
         % (time.time() - t0, net, pulled, cap or "?"))
+    log("ip: %s" % (current_ip() or "none"))
 
 
 def daemonize():
