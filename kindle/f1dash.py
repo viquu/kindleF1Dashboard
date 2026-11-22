@@ -186,8 +186,16 @@ def maybe_autosleep(refreshed):
 
 
 def fetch_json(url, timeout=12):
-    """通用 JSON GET(侧栏数据源共用);失败抛异常,由调用方按块兜底。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "f1dash/1.0"})
+    """通用 JSON GET(侧栏数据源共用);失败抛异常,由调用方按块兜底。
+
+    必须带 Accept: */* —— Jolpica 在 Cloudflare 后面且 Vary: Accept,urllib
+    默认不带 Accept 的请求会命中边缘缓存里粘性的空数据变体(2026-11-22 实测
+    /2026/21/results.json 恒返回 total=0,拉斯维加斯赛果整小时不上屏;带
+    Accept: */* 或任意新缓存键即恢复。application/json 也是坏档,唯一与源站
+    一致的是 */*)。
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "f1dash/1.0",
+                                               "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
         return json.load(resp)
 
