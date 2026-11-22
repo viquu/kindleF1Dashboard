@@ -1076,10 +1076,11 @@ def png_render(data, out=SS_OUT):
         _draw_dashboard(d, data, font, text)
 
     img = img.resize(SS_SIZE, Image.LANCZOS)
-    # 1-bit 化:LANCZOS 缩回会把细笔画混成中灰,eips 对灰阶的量化不可预测;
-    # 硬阈值(>160 视为白)出纯黑白 758x1024,笔画实心不发虚。0/255 输入下
-    # convert("1") 的抖动不产生任何误差,安全。
-    img = img.point(lambda p: 255 if p > 160 else 0).convert("1")
+    # 两端钳位:硬阈值(全拍纯黑白)把 AA 边缘像素也拍成锯齿,实测字体锯齿过重;
+    # 改为笔画芯(<64)拍纯黑防发虚、背景(>160)拍纯白,64-160 的 1px AA 过渡带
+    # 保留中深灰阶 —— 深灰在 e-ink 量化稳定(发虚的是 180-240 浅灰,已被排除),
+    # 电量角标同为灰度直出,屏上边缘实测平滑。出图仍 758x1024 8-bit 灰度。
+    img = img.point(lambda p: 0 if p < 64 else (255 if p > 160 else p))
     img.save(out)
     print("saved:", out, img.size, img.mode)
     return True
