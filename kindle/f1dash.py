@@ -18,9 +18,13 @@ Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十�
 云端不可达不做本机渲染,直接保留最后一张屏保图(渲染代码保留,供云端与开发预览复用)。
 一键回睡(auto_sleep 标志文件):信息牌模式下唤醒 → 刷新 → 模拟电源键
 自动入睡,锁屏永远显示最新图;想正常阅读时在 KUAL 菜单关闭开关。
-常显模式(alwayson):设备永不入睡,每小时拉云端图 eips 全屏重显示;RTC 无法
-从挂起唤醒(见下),常显就是用续航换全天候实时。Wi-Fi 常开不关(2026-11-15
-用户决策:实测 wifid 软关无效、硬关有把拉图链路搞挂的风险,代价 ~30-60 mAh/h)。
+常显模式(alwayson):设备永不入睡,每小时整点拉云端图 eips 全屏重显示;RTC 无法
+从挂起唤醒(见下),常显就是用续航换全天候实时。Wi-Fi 整点硬开、拉图后保持
+ALWAYS_WIFI_WINDOW(默认 5 分钟)再硬关 —— 开窗可预期,SSH/运维在 :00-:05 随便
+连(2026-11-22 实测:软关 lipc enable 0 会被 wifid ~15s 翻回,形同虚设;硬关
+stop wifid + ifconfig down 可靠,off 窗口不回弹,冷启 6s 回连,路由器静态 IP
+预留无需等 DHCP;连续 3 轮失败 fail-open 退回 Wi-Fi 常开,宁可多耗电不把屏
+死在旧图上;/mnt/us/f1dash/wifi_hold 标志存在时本轮豁免硬关,供长时运维)。
 framework 停了屏上看不到状态栏电量,拉图后本地把电量角标(电池图标+百分比+
 实测外推续航,低电加顶部警告条)叠进底部白边,不必 SSH 就知道还能撑多久。
 
@@ -1166,14 +1170,17 @@ def service_mode():
 
 # ---------------- 常显模式(always-on) ----------------
 #
-# 与 service 模式互补的信息牌形态:设备永不入睡,每小时拉一次成图(Wi-Fi 常开
-# 不关,见 wifi()),成图或电量角标有变才 eips 全屏重显示。PW1 的 RTC 闹钟
+# 与 service 模式互补的信息牌形态:设备永不入睡,每小时整点拉一次成图(Wi-Fi
+# 整点开、保持 ALWAYS_WIFI_WINDOW 再硬关,见 wifi()/always_cycle),成图或电量
+# 角标有变才 eips 全屏重显示。PW1 的 RTC 闹钟
 # 无法从挂起唤醒内核(见文件头),睡着就刷不了;常显等于用续航换全天候实时。
 # 前置光始终关闭 —— 常显模式下它是最大的单一耗电源。
 # 循环内每轮重申防入睡标志并重试熄灯,防框架重置。
 
 ALWAYS_OUT = "/mnt/us/f1dash/latest.png"   # eips 全屏显示用成图(SS_OUT + 电量角标)
-ALWAYS_INTERVAL = 3600                     # 常显刷新周期(秒)
+ALWAYS_INTERVAL = 3600                     # 常显刷新周期(秒;循环对齐到周期网格,3600 即每小时整点)
+ALWAYS_WIFI_WINDOW = 300                   # 整点开窗保持秒数:拉图后保持 Wi-Fi 供 SSH/运维,到点硬关
+WIFI_HOLD_FLAG = "/mnt/us/f1dash/wifi_hold"  # 存在则本轮不硬关(长时运维豁免;删掉即恢复)
 BADGE_STRIP_H = 26                         # 底部白边高度(画布物理像素,角标所在)
 LOW_BATT_PCT = 15                          # 电量不高于此值时顶部加黑底警告条
 BATT_SYSFS = "/sys/devices/system/yoshi_battery/yoshi_battery0"
@@ -1182,6 +1189,8 @@ BATT_SAMPLE = 300                          # 采样周期:电芯计量更新缓�
 FL_SYSFS = "/sys/devices/system/fl_tps6116x/fl_tps6116x0/fl_intensity"
 # 前光硬件档位(0-254):唯一能真写 0 的口。cat 返回 'FrontLight(Intensity) = N'
 # 非纯整数;lipc flIntensity 0 只是把 UI 档钳到硬件 1(假灭,LED 仍微亮)
+WIFI_FAIL_OPEN = 3    # 连续断网/拉图失败达到此轮数 → fail-open,Wi-Fi 保持常开
+_wifi_fail_streak = 0  # 连续失败轮计数(首个成功拉图复位,见 always_cycle)
 
 
 def _sysfs_int(name):
@@ -1340,49 +1349,135 @@ def framework_ensure_stopped():
 
 WLAN_IF = "wlan0"                  # PW1 无线接口(/proc/net/route 实测)
 IFCONFIG = "/sbin/ifconfig"
+WIFI_JOB = "wifid"                 # Wi-Fi 主控 upstart job(2026-11-22 initctl 实测)
+# Wi-Fi 链路(2026-11-22 设备实测):wifid(主控,respawn)按需拉起 wifim
+# (驱动 modprobe ar6003)与 wifis(wpa_supplicant)。stop wifid 不会停 wifis
+# (supplicant 幸存,但 wlan0 已 down 无关联);start wifid 冷启自带 enable=1
+# 并自动关联,静态 IP 预留下 ~6s 拿到默认路由。
+
+def _route_up():
+    """默认路由是否在 /proc/net/route(wait_network 与 wifi 硬关验证共用)。"""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) > 1 and parts[1] == "00000000":
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _wlan_up():
+    """wlan0 UP 标志是否还在(ifconfig flags 行);查不了按仍开着处理,让验证
+    失败显式告警,而不是静默当成已关。"""
+    try:
+        out = subprocess.run([IFCONFIG, WLAN_IF], capture_output=True, text=True,
+                             timeout=5).stdout
+        for line in out.splitlines():
+            flags = line.split()
+            if any(tok.startswith("MTU") for tok in flags):
+                # flags 行:"UP BROADCAST ... MTU:1500 Metric:1";MTU 带值,
+                # 整 token 相等永远匹配不上(2026-11-22 实测踩坑)
+                return "UP" in flags
+    except Exception:
+        pass
+    return True
 
 
 def wifi(on):
-    """Wi-Fi 开关:指挥 wifid(独立守护,framework 生死都可用)。
+    """Wi-Fi 硬开关(2026-11-22 上线;此前 off 分支是空操作)。
 
-    wirelessEnable(cmd)是 framework 提供的 UI 层开关(会弹框/无人响应),不能用;
-    enable 1 关联+拉图实测可用。enable 0 实测并不拆除关联——wifid 会把属性翻回
-    1 并 ~15s 内自动重连,软关形同虚设;真要省电须停 wifid job 本体(未上线,
-    2026-11-15 用户决策:常显 Wi-Fi 常开不关,避免硬关影响拉图链路)。故 off
-    分支为空操作,on 保留自愈语义(接口 up + enable 1,断网后每轮自动恢复)。
+    软关无效实测:lipc-set-prop wifid enable 0 后 wifid 自己把属性翻回 1 并
+    ~15s 内自动重连,形同虚设。真关必须停 wifid job 本体(见 WIFI_JOB)+ 接口
+    down:wifid 停止后 lipc 源消失(get/set 报 lipcErrNoSuchSource),属性不可能
+    翻回;off 窗口 60s 实测不回弹,无默认路由、wlan0 无 UP/RUNNING。
+    off 序列:lipc enable 0 → stop wifid → ifconfig down(每步记 rc,收尾验证
+    路由+接口,不完全即返回 False 交上层告警);已停/源已消失都算目标状态。
+    on 序列:ifconfig up → start wifid → lipc enable 1;start 后立刻 lipc set
+    会撞源未注册竞态,失败隔 2s 重试共 3 次,全失败也继续——冷启 wifid 自带
+    enable=1 会自己回连(实测 6s 拿到路由)。已运行的 job start 报 already
+    running(fail-open 常开时每轮都走这里),按成功计。
     """
-    if not on:
-        return False
+    if on:
+        return _wifi_up()
+    return _wifi_down()
+
+
+def _wifi_down():
+    """硬关三层依次执行并验证;返回 True=验证已关(路由与 UP 标志都消失)。"""
+    rc_lipc = rc_stop = rc_ifdown = -1
     try:
-        subprocess.run([IFCONFIG, WLAN_IF, "up"], capture_output=True, timeout=5)
+        r = subprocess.run(["lipc-set-prop", "com.lab126.wifid", "enable", "0"],
+                           capture_output=True, timeout=5)
+        rc_lipc = r.returncode
     except Exception as exc:
-        log("ifconfig up failed: %r" % exc)
+        log("wifi off: lipc enable 0 failed: %r" % exc)
     try:
-        subprocess.run(["lipc-set-prop", "com.lab126.wifid", "enable", "1"],
-                       capture_output=True, timeout=5)
-        return True
+        r = subprocess.run(["/sbin/stop", WIFI_JOB], capture_output=True, timeout=15)
+        rc_stop = r.returncode
+        if rc_stop != 0 and (b"Unknown instance" in (r.stderr or b"")
+                             or b"Unknown job" in (r.stderr or b"")):
+            rc_stop = 0   # 本来就没在跑,正是想要的状态
     except Exception as exc:
-        log("wifid enable(1) failed: %r" % exc)
+        log("wifi off: stop %s failed: %r" % (WIFI_JOB, exc))
+    try:
+        r = subprocess.run([IFCONFIG, WLAN_IF, "down"], capture_output=True, timeout=5)
+        rc_ifdown = r.returncode
+    except Exception as exc:
+        log("wifi off: ifconfig down failed: %r" % exc)
+    route_gone = not _route_up()
+    wlan_down = not _wlan_up()
+    log("wifi off: rc lipc=%d stop=%d ifdown=%d route_gone=%s wlan_down=%s"
+        % (rc_lipc, rc_stop, rc_ifdown, route_gone, wlan_down))
+    return route_gone and wlan_down
+
+
+def _wifi_up():
+    """硬开三层依次执行(ifconfig up → start wifid → lipc enable 1)。
+
+    返回 True=start 或 lipc 至少一个成功;拿不到路由由调用方 wait_network +
+    重试序列兜底。
+    """
+    rc_ifup = rc_start = rc_lipc = -1
+    try:
+        r = subprocess.run([IFCONFIG, WLAN_IF, "up"], capture_output=True, timeout=5)
+        rc_ifup = r.returncode
+    except Exception as exc:
+        log("wifi on: ifconfig up failed: %r" % exc)
+    try:
+        r = subprocess.run(["/sbin/start", WIFI_JOB], capture_output=True, timeout=15)
+        rc_start = r.returncode
+        if rc_start != 0 and b"already running" in ((r.stderr or b"") + (r.stdout or b"")):
+            rc_start = 0   # fail-open 常开时每轮 start 都会撞上,按成功计
+    except Exception as exc:
+        log("wifi on: start %s failed: %r" % (WIFI_JOB, exc))
+    for _ in range(3):   # start 后 lipc 源注册有竞态(rc=3 NoSuchSource),隔 2s 再试
         try:
-            subprocess.run(["lipc-set-prop", "com.lab126.cmd",
-                            "wirelessEnable", "1"], capture_output=True, timeout=5)
-        except Exception as exc2:
-            log("cmd wirelessEnable(1) failed: %r" % exc2)
-        return False
+            r = subprocess.run(["lipc-set-prop", "com.lab126.wifid", "enable", "1"],
+                               capture_output=True, timeout=5)
+            if r.returncode == 0:
+                rc_lipc = 0
+                break
+            rc_lipc = r.returncode
+        except Exception as exc:
+            log("wifi on: lipc enable 1 failed: %r" % exc)
+            rc_lipc = -1
+        time.sleep(2)
+    log("wifi on: rc ifup=%d start=%d lipc=%d" % (rc_ifup, rc_start, rc_lipc))
+    return rc_start == 0 or rc_lipc == 0
 
 
-def wait_network(timeout=60):
-    """等 Wi-Fi 完成关联并拿到默认路由;超时返回 False。"""
+def wait_network(timeout=90):
+    """等 Wi-Fi 完成关联并拿到默认路由;超时返回 False。
+
+    默认 90s:硬关后冷启 wifid 要重走驱动→supplicant→关联→DHCP 全流程
+    (实测 6s,路由器静态 IP 预留;60s 是软关时代老值,对冷启留足余量)。
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        try:
-            with open("/proc/net/route") as f:
-                for line in f.read().splitlines()[1:]:
-                    parts = line.split()
-                    if len(parts) > 1 and parts[1] == "00000000":
-                        return True
-        except Exception:
-            pass
+        if _route_up():
+            return True
         time.sleep(2)
     return False
 
@@ -1595,52 +1690,84 @@ def current_ip():
 
 
 def always_cycle():
-    """一轮常显刷新:巡检 dropbear → 确保 Wi-Fi → 拉图 → 图/电量有变才叠加角标并全屏显示。
+    """一轮常显刷新:巡检 dropbear → Wi-Fi 硬开 → 拉图 → 图/电量有变才显示 → finally 保持开窗后硬关。
 
-    开头先巡检 dropbear(SSH 入站自愈,见 dropbear_watchdog),与拉图同在一个
-    小时循环里;末尾记录 wlan0 当前 IP,下次 SSH 失联可先分辨是不是 DHCP 换址。
-    云端原图只进 SS_OUT(锁屏图保持干净,framework 活着时状态栏自有电量),
-    eips 显示图由 overlay_battery 从 SS_OUT 现算:即使拉图失败,角标上的
-    电量/续航也随每轮更新。成图没变(pull_image 对相同字节不写盘,比对前后
-    内容即知)且角标电量没变时跳过重显,静等下一轮;成图有变走整屏 flash
-    清残影(-g -f 的 full update 实测清不掉,见 show_fullscreen)。
+    Wi-Fi 整点硬开,拉图完成后保持到 ALWAYS_WIFI_WINDOW 截止(整点后 5 分钟,
+    SSH/运维的可预期窗口),到点 finally 硬关(拉图失败也照关,失败的一轮绝不
+    把 Wi-Fi 常开整小时)。连续 WIFI_FAIL_OPEN 轮拿不到网/拉图失败则 fail-open:
+    Wi-Fi 保持常开继续每小时重试拉图,直到首个成功轮复位计数——宁可退回软关
+    时代的耗电,也不能让屏面永远死在旧图上;wifi_hold 标志存在时本轮豁免硬关。
+    首次硬开拿不到路由时重试一次完整启动序列(lipc set 的源注册竞态由
+    _wifi_up 内部重试)。开头先巡检 dropbear(SSH 入站自愈,见 dropbear_watchdog);
+    IP 在 Wi-Fi 还开着时记录(硬关后 inet addr 仍在,读到的是假象)。云端原图
+    只进 SS_OUT(锁屏图保持干净,framework 活着时状态栏自有电量),eips 显示图
+    由 overlay_battery 从 SS_OUT 现算:即使拉图失败,角标上的电量/续航也随每轮
+    更新。成图没变(pull_image 对相同字节不写盘,比对前后内容即知)且角标
+    电量没变时跳过重显,静等下一轮;成图有变走整屏 flash 清残影(-g -f 的
+    full update 实测清不掉,见 show_fullscreen)。
     """
-    global _last_shown_pct
+    global _last_shown_pct, _wifi_fail_streak
     t0 = time.time()
     dropbear_watchdog()
     wifi(True)
-    net = wait_network()
-    prev = _read_bytes(SS_OUT)
-    pulled = False
-    if net:
-        pulled = pull_image(outs=(SS_OUT,))
-        if not pulled:
-            log("cycle: pull failed; keep last image")
-    else:
-        log("cycle: no network; keep last image")
-    image_changed = _read_bytes(SS_OUT) != prev
-    cap = _sysfs_raw("battery_capacity")
+    net = pulled = False
+    cap = "?"
     try:
-        pct = int(cap.rstrip("%"))
-    except ValueError:
-        pct = None
-    if image_changed or (pct is not None and pct != _last_shown_pct):
-        shown = None
-        if os.path.exists(SS_OUT):
-            shown = ALWAYS_OUT if overlay_battery() else SS_OUT
-        elif os.path.exists(ALWAYS_OUT):
-            shown = ALWAYS_OUT
-        if shown:
-            show_fullscreen(shown, flash=image_changed)   # 成图有变才整屏 flash 清残影
-            if image_changed:
-                log("cycle: image changed; refresh with fullscreen flash")
-            _last_shown_pct = pct
-            front_light_off()   # 绘制/eips 后重申:单次熄灯是已知脆弱模式,会爬回 1
-    else:
-        log("cycle: image and battery unchanged; skip eips refresh")
-    log("cycle done in %ds: net=%s pull=%s battery %s"
-        % (time.time() - t0, net, pulled, cap or "?"))
-    log("ip: %s" % (current_ip() or "none"))
+        t_net = time.time()
+        net = wait_network()
+        if net:
+            log("cycle: wifi up, route in %.0fs" % (time.time() - t_net))
+        else:
+            log("cycle: no network; retry wifi start sequence")
+            wifi(True)
+            t_net = time.time()
+            net = wait_network(45)
+            if net:
+                log("cycle: wifi up on retry, route in %.0fs" % (time.time() - t_net))
+        prev = _read_bytes(SS_OUT)
+        if net:
+            pulled = pull_image(outs=(SS_OUT,))
+            if not pulled:
+                log("cycle: pull failed; keep last image")
+        else:
+            log("cycle: no network; keep last image")
+        image_changed = _read_bytes(SS_OUT) != prev
+        cap = _sysfs_raw("battery_capacity")
+        try:
+            pct = int(cap.rstrip("%"))
+        except ValueError:
+            pct = None
+        if image_changed or (pct is not None and pct != _last_shown_pct):
+            shown = None
+            if os.path.exists(SS_OUT):
+                shown = ALWAYS_OUT if overlay_battery() else SS_OUT
+            elif os.path.exists(ALWAYS_OUT):
+                shown = ALWAYS_OUT
+            if shown:
+                show_fullscreen(shown, flash=image_changed)   # 成图有变才整屏 flash 清残影
+                if image_changed:
+                    log("cycle: image changed; refresh with fullscreen flash")
+                _last_shown_pct = pct
+                front_light_off()   # 绘制/eips 后重申:单次熄灯是已知脆弱模式,会爬回 1
+        else:
+            log("cycle: image and battery unchanged; skip eips refresh")
+        log("ip: %s" % (current_ip() or "none"))
+    finally:
+        if pulled:
+            _wifi_fail_streak = 0
+        else:
+            _wifi_fail_streak += 1
+        if _wifi_fail_streak >= WIFI_FAIL_OPEN:
+            log("fail-open: leaving wifi on after %d failed cycles" % _wifi_fail_streak)
+        elif os.path.exists(WIFI_HOLD_FLAG):
+            log("wifi hold flag present; leaving wifi on this cycle")
+        else:
+            remain = t0 + ALWAYS_WIFI_WINDOW - time.time()
+            if remain > 0:
+                time.sleep(remain)   # 开窗保持:整点后 5 分钟留给 SSH/运维,到点再关
+            log("wifi hard-off %s" % ("ok" if wifi(False) else "NOT verified"))
+        log("cycle done in %ds: net=%s pull=%s battery %s"
+            % (time.time() - t0, net, pulled, cap or "?"))
 
 
 def daemonize():
@@ -1662,10 +1789,18 @@ def daemonize():
         os.close(null)
 
 
+def _next_grid_sleep(interval):
+    """睡到 interval 网格的下一个对齐点(epoch 整倍数;3600 → 每小时整点,测试
+    短间隔 → 对齐分钟网格),让 SSH/运维的开窗时刻可预期。"""
+    now = time.time()
+    return max(1.0, (int(now // interval) + 1) * interval - now)
+
+
 def always_on_mode(interval=None):
-    """常显主循环:启动即刷一轮,之后每 interval 秒重申防入睡并再刷一轮。
+    """常显主循环:启动即刷一轮,之后睡到周期网格对齐点再重申防入睡并刷一轮。
 
     间隔优先级:--interval 参数 > F1DASH_ALWAYSON_INTERVAL 环境变量 > 默认 3600。
+    循环对齐到网格(3600 → 整点拉图,Wi-Fi 开窗 :00-:05 可预期)。
     实际等待超过预期 2 分钟视为发生过挂起(常显模式不该出现),记日志供排查。
     """
     if not interval:
@@ -1686,10 +1821,11 @@ def always_on_mode(interval=None):
     front_light_off()   # 停框架之后:停机会重套滑块亮度,先停再灭
     always_cycle()
     while True:
+        nap = _next_grid_sleep(interval)
         t0 = time.time()
-        time.sleep(interval)
+        time.sleep(nap)
         elapsed = time.time() - t0
-        if elapsed > interval + 120:
+        if elapsed > nap + 120:
             log("warning: %ds gap in loop — system suspended?" % round(elapsed))
         keep_awake(True)
         if framework_ensure_stopped():

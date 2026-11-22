@@ -2,8 +2,10 @@
 # 部署 F1 Dashboard 到 Kindle(依赖 ~/.ssh/config 别名 kindle)。
 # 幂等可重跑:代码变更后再次执行即可增量更新。
 #
-# 常显模式注意:Wi-Fi 每小时只开 ~15-40s,SSH 必须在窗口内连上;脚本第一件事
-# 就是探测并杀掉常显守护 —— 守护死了没人关 Wi-Fi,连接保住,后续上传不慌。
+# 常显模式注意:每小时整点拉图,Wi-Fi 开窗保持 5 分钟(:00-:05),SSH 在窗口内
+# 随便连;要更长的运维时间,先在窗口内 touch /mnt/us/f1dash/wifi_hold(守护本轮
+# 豁免硬关,用完删掉即恢复)。脚本第一件事仍是探测并杀掉常显守护 —— 守护死了
+# 没人关 Wi-Fi,连接保住,后续上传不慌。
 # 用法: bash kindle/deploy.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
