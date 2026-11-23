@@ -1808,6 +1808,22 @@ def _draw_evening(d, data, font, text, cjk, ctext):
     _status_bar(d, font, text, "EVENING BRIEFING · %s" % upd)
 
 
+def _weekend_dates(now_bj):
+    """本周六/周日/下周一的 struct_time(北京时间)。
+
+    周五 18:00 看即将到的周六日;周六看今天/明天;周日看昨天/今天;
+    周一–周四(仅 --weekend 强制渲染时走到)看本周六/日。周六偏移:
+    周一 +5、周二 +4、周三 +3、周四 +2、周五 +1、周六 0、周日 -1。
+    """
+    base = calendar.timegm(now_bj) - 8 * 3600
+    wd = now_bj.tm_wday
+    sat_off = -1 if wd == 6 else 5 - wd
+    sat = time.gmtime(base + sat_off * 86400)
+    sun = time.gmtime(base + (sat_off + 1) * 86400)
+    mon = time.gmtime(base + (sat_off + 2) * 86400)
+    return sat, sun, mon
+
+
 def _draw_weekend(d, data, font, text, cjk, ctext):
     """周末屏 v2(设计稿 §4):页眉 70 / 两天天气 210 / 本周回顾 170 / 周末比赛 150 / 下周一预告 150 / 状态栏 34。"""
     now_bj = data.get("now_bj") or _beijing_now()
@@ -1815,13 +1831,7 @@ def _draw_weekend(d, data, font, text, cjk, ctext):
     d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
     _brief_header(d, font, text, ctext, cjk, now_bj, "WEEKEND", upd)
 
-    # 本周六/周日:周五 18:00 看即将到的周六日;周六看今天/明天;周日看昨天/今天
-    base = calendar.timegm(now_bj) - 8 * 3600
-    wd = now_bj.tm_wday
-    sat_off = {4: 1, 5: 0, 6: -1}.get(wd, 1)
-    sat = time.gmtime(base + sat_off * 86400)
-    sun = time.gmtime(base + (sat_off + 1) * 86400)
-    mon = time.gmtime(base + (sat_off + 2) * 86400)
+    sat, sun, mon = _weekend_dates(now_bj)
 
     def _day_box(x0, x1, day_gmt, label_cn):
         date_str = time.strftime("%Y-%m-%d", day_gmt)
