@@ -959,10 +959,23 @@ def select_briefing_template(now=None):
 def get_briefing_data(headlines_path=None, briefing_path=None, now=None):
     """床头屏数据:get_dashboard_data() + 头条 + 补充数据 + 模板选择。
 
-    err 不为 None 时 render.py 沿用旧逻辑(保留上一张图,exit 1)。
+    err 不为 None 时 render.py 沿用旧逻辑(保留上一张图,exit 1)——
+    但床头屏(morning/evening/weekend)例外:它们不依赖 F1 赛历,赛历
+    拉不到且无缓存时也出图。此时补拉天气/巴萨/Trending(各自走缓存容错),
+    F1 相关块留空或显示无数据;仪表盘/海报仍保留旧逻辑(赛历是主数据)。
     """
     out = get_dashboard_data()
     out["template"] = select_briefing_template(now)
+    if out["err"] is not None and out["template"] in ("morning", "evening", "weekend"):
+        # 首跑空缓存 + Jolpica 挂了也会出图:只丢 F1 块,不丢整张屏。
+        for key, getter in (("weather", get_weather), ("barca", get_barca),
+                            ("trending", get_trending)):
+            val, entry = _cached_fetch(key, getter)
+            if val is not None:
+                out[key] = val
+            if entry is not None:
+                _mark_stale(out, key, entry)
+        out["err"] = None
     out["headlines"] = read_headlines(headlines_path)
     out["briefing"] = read_briefing(briefing_path)
     out["now_bj"] = _beijing_now(now)
@@ -1700,6 +1713,8 @@ def _draw_morning(d, data, font, text, cjk, ctext):
         f1_lines.append(nr["raceName"])
         f1_lines.append("%s %s" % (short_date(nr["date"]),
                                    format_race_daytime(nr) or "TBD"))
+    if not f1_lines:
+        f1_lines = ["F1 数据暂无更新"]
     b = data.get("barca") or {}
     barca_lines = []
     if b.get("opponent"):
