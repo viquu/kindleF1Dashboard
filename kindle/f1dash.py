@@ -209,6 +209,134 @@ def fetch(path):
     return fetch_json(API_BASE + path, timeout=30)
 
 
+# ---------------- 最近一次好数据缓存(TTL + 降级) ----------------
+# 规则(Ken 2026-11-23):渲染定时器仍每 10 分钟跑,但每个源只在缓存过期
+# (TTL)时才联网拉取;拉取失败用上次成功的数据渲染,既不跳过该区块、也不
+# 让整张图失败;失败的拉取永不覆盖缓存。缓存文件与 f1dash.py 同目录
+# (云端 /opt/f1dash/f1_cache.json,不在 nginx 静态目录下,不对外公开)。
+# TTL 按数据源变化速度定:赛历/积分/赛果/排位/冲刺只在比赛周末变(6h),
+# 天气是日频预报(1h),巴萨赛程/榜位变化慢(6h),GitHub Trending 日更(6h)。
+# MAX_AGE 是缓存作为"上次好数据"的最长可用期,超期按无缓存处理。
+F1_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "f1_cache.json")
+_CACHE_TTL_S = {"calendar": 6 * 3600, "standings": 6 * 3600,
+                "constructors": 6 * 3600, "last_results": 6 * 3600,
+                "qualifying": 6 * 3600, "sprint": 6 * 3600,
+                "weather": 3600, "barca": 6 * 3600, "trending": 6 * 3600}
+_CACHE_MAX_AGE_S = {"calendar": 7 * 86400, "standings": 7 * 86400,
+                    "constructors": 7 * 86400, "last_results": 7 * 86400,
+                    "qualifying": 7 * 86400, "sprint": 7 * 86400,
+                    "weather": 2 * 86400, "barca": 7 * 86400,
+                    "trending": 2 * 86400}
+# 缓存键前缀决定组名(图片角标用):排位/冲刺的键是 "qualifying-<赛季>-<轮次>",
+# 前缀仍归 F1 组。
+_CACHE_GROUP_LABEL = {"calendar": "F1", "standings": "F1",
+                      "constructors": "F1", "last_results": "F1",
+                      "qualifying": "F1", "sprint": "F1",
+                      "weather": "WEATHER", "barca": "BARCA",
+                      "trending": "TRENDING"}
+
+
+def _cache_read():
+    try:
+        with open(F1_CACHE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cache_entry(key):
+    """缓存条目原文(不判年龄);无/损坏返回 None。"""
+    try:
+        entry = _cache_read().get(key)
+        return entry if isinstance(entry, dict) and "data" in entry else None
+    except Exception:
+        return None
+
+
+def _cache_put(key, data):
+    """仅成功拉取后调用:原子写;写失败不影响渲染,也不动旧缓存。"""
+    try:
+        cache = _cache_read()
+        cache[key] = {"fetched_at": time.time(), "data": data}
+        tmp = F1_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, F1_CACHE_FILE)
+        return True
+    except Exception as exc:
+        print("cache write failed: %r" % (exc,)[:60])
+        return False
+
+
+def _cache_date(entry):
+    """缓存条目的抓取日期(北京时间 MM-DD),供图片角标展示过期数据。"""
+    try:
+        bj = time.gmtime(float(entry["fetched_at"]) + 8 * 3600)
+        return time.strftime("%m-%d", bj)
+    except Exception:
+        return "?"
+
+
+def _cached_fetch(key, fetch_fn, format_fn=None):
+    """带 TTL 的缓存拉取,返回 (value, stale_entry)。
+
+    - 缓存未过期(TTL 内):直接用缓存,不联网,stale_entry=None。
+    - 缓存过期:联网拉取;成功则更新缓存并返回新值;失败则用未超期
+      (MAX_AGE 内)的上次好数据并返回其缓存条目(调用方据此记 stale)。
+    - 都失败返回 (None, None)。失败的拉取永不写缓存。
+    format_fn 把原始拉取结果整成渲染要用的值;缓存里存的是原始结果,
+    所以 TTL 命中与兜底都走同一条 format 路径。
+    """
+    now = time.time()
+    # 排位/冲刺的键带赛季-轮次后缀("qualifying-2026-23"),TTL/MAX_AGE 按前缀取。
+    ttl_key = key.split("-")[0]
+    entry = _cache_entry(key)
+    if entry is not None:
+        try:
+            age = now - float(entry.get("fetched_at", 0))
+        except Exception:
+            age = None
+        if age is not None and 0 <= age <= _CACHE_TTL_S.get(ttl_key, 3600):
+            try:
+                raw = entry["data"]
+                return (format_fn(raw) if format_fn else raw), None
+            except Exception:
+                entry = None  # 缓存损坏:视为无缓存,走联网拉取
+    try:
+        raw = fetch_fn()
+        value = format_fn(raw) if format_fn else raw
+    except Exception as exc:
+        if entry is not None:
+            try:
+                age = now - float(entry.get("fetched_at", 0))
+            except Exception:
+                age = None
+            if age is not None and 0 <= age <= _CACHE_MAX_AGE_S.get(ttl_key, 7 * 86400):
+                try:
+                    raw = entry["data"]
+                    return (format_fn(raw) if format_fn else raw), entry
+                except Exception:
+                    pass
+        print("%s fetch failed, no usable cache: %r" % (key, repr(exc)[:60]))
+        return None, None
+    _cache_put(key, raw)
+    return value, None
+
+
+def _mark_stale(out, key, entry):
+    """把一次缓存兜底记到 out["stale"]:组名 → (最旧那份缓存的 epoch, 日期)。"""
+    label = _CACHE_GROUP_LABEL.get(key.split("-")[0], key.upper())
+    try:
+        fetched = float(entry.get("fetched_at", 0))
+    except Exception:
+        return
+    prev = out["stale"].get(label)
+    if prev is None or fetched < prev[0]:
+        out["stale"][label] = (fetched, _cache_date(entry))
+
+
 def find_next_race(races):
     """按 round 顺序找下一场(比赛开始 2 小时内仍算"当前")。"""
     now = time.time()
@@ -374,25 +502,35 @@ def fmt_sprint(results):
 
 
 def weekend_poster_sessions(next_race, season, now=None):
-    """海报结果块列表 [{key,label,rows}...];仅拉已结束会话,每块独立容错(失败空 rows)。"""
+    """海报结果块列表 [{key,label,rows}...] + 最旧的一份缓存兜底条目(无则 None)。
+
+    仅拉已结束会话,每块独立容错:拉取失败用上次好数据(TTL 缓存,键按
+    "会话-赛季-轮次"),无可用缓存才空 rows、跳过该块。返回 (blocks, stale_entry)。
+    """
     blocks = []
+    stale_entry = None
     for key, label, _ in completed_sessions(next_race, now):
-        try:
-            if key == "qualifying":
-                res = fetch("%s/%s/qualifying.json" % (season, next_race["round"]))
+        cache_key = "%s-%s-%s" % (key, season, next_race["round"])
+        if key == "qualifying":
+            def _fmt(res):
                 arr = res["MRData"]["RaceTable"]["Races"][0]["QualifyingResults"]
-                rows = fmt_qualifying(arr)
-            elif key == "sprint":
-                res = fetch("%s/%s/sprint.json" % (season, next_race["round"]))
+                return fmt_qualifying(arr)
+            fetch_fn = lambda: fetch("%s/%s/qualifying.json" % (season, next_race["round"]))
+        elif key == "sprint":
+            def _fmt(res):
                 arr = res["MRData"]["RaceTable"]["Races"][0]["SprintResults"]
-                rows = fmt_sprint(arr)
-            else:
-                continue
-        except Exception:
-            rows = []
+                return fmt_sprint(arr)
+            fetch_fn = lambda: fetch("%s/%s/sprint.json" % (season, next_race["round"]))
+        else:
+            continue
+        rows, entry = _cached_fetch(cache_key, fetch_fn, _fmt)
+        if entry is not None:
+            if (stale_entry is None
+                    or float(entry.get("fetched_at", 0)) < float(stale_entry.get("fetched_at", 0))):
+                stale_entry = entry
         if rows:
             blocks.append({"key": key, "label": label, "rows": rows})
-    return blocks
+    return blocks, stale_entry
 
 
 _tracks = None
@@ -580,7 +718,13 @@ def get_trending():
 
 
 def get_dashboard_data():
-    """拉取并整理数据;赛历是唯一主获取,其余各块独立容错(失败只影响对应区块)。"""
+    """拉取并整理数据;每个源走 _cached_fetch(TTL 缓存 + 失败用上次好数据)。
+
+    赛历仍是主获取,但不再是单点失败:拉取失败且无可用缓存时才置 err、
+    整张图保留上一张;有缓存时用缓存渲染并记 stale。积分/赛果/资讯盒
+    各自容错,失败时用缓存,无缓存才留空。out["stale"] 记组名 → (最旧
+    缓存 epoch, 抓取日期 MM-DD),渲染时在页脚/区块标题处展示。
+    """
     # Kindle 时区未设置(按 UTC 走),更新时间按北京时间(UTC+8)显示
     upd = time.gmtime(time.time() + 8 * 3600)
     out = {"next_race": None, "last_race": None, "standings": [],
@@ -588,12 +732,13 @@ def get_dashboard_data():
            "progress": None, "season": None, "poster_sessions": [],
            "weather": None, "barca": None, "trending": None,
            "upd": time.strftime("%H:%M", upd), "upd_stamp": time.strftime("%m-%d %H:%M", upd),
-           "err": None}
-    try:
-        cal = fetch("current.json")
-    except Exception as exc:
-        out["err"] = exc
+           "err": None, "stale": {}}
+    cal, entry = _cached_fetch("calendar", lambda: fetch("current.json"))
+    if cal is None:
+        out["err"] = RuntimeError("calendar fetch failed, no usable cache")
         return out
+    if entry is not None:
+        _mark_stale(out, "calendar", entry)
     rt = cal["MRData"]["RaceTable"]
     season = rt["season"]
     races = rt["Races"]
@@ -603,42 +748,63 @@ def get_dashboard_data():
     if nr is not None:
         # 仅赛事周末:拉已结束会话的排位/冲刺赛结果,供海报展示
         if race_poster_active(out):
-            out["poster_sessions"] = weekend_poster_sessions(nr, season)
+            out["poster_sessions"], entry = weekend_poster_sessions(nr, season)
+            if entry is not None:
+                _mark_stale(out, "qualifying", entry)
     out["progress"] = season_progress(races, nr, lr)
 
     # 用赛季号派生路径(而非 current):1 月跨赛季窗口时 current/24/results 会 404,
     # 2026/24/results 永远可查
-    try:
-        stand = fetch(season + "/driverstandings.json")
+    def _standings_fmt(stand):
         drivers = stand["MRData"]["StandingsTable"]["StandingsLists"][0]["DriverStandings"]
-        out["standings"] = fmt_standings(drivers)
-    except Exception:
-        pass
-    try:
-        cons = fetch(season + "/constructorstandings.json")
+        return fmt_standings(drivers)
+
+    val, entry = _cached_fetch(
+        "standings", lambda: fetch(season + "/driverstandings.json"),
+        _standings_fmt)
+    if val is not None:
+        out["standings"] = val
+    if entry is not None:
+        _mark_stale(out, "standings", entry)
+
+    def _constructors_fmt(cons):
         cs = cons["MRData"]["StandingsTable"]["StandingsLists"][0]["ConstructorStandings"]
-        out["constructors"] = fmt_constructors(cs)
-    except Exception:
-        pass
-    try:
+        return fmt_constructors(cs)
+
+    val, entry = _cached_fetch(
+        "constructors", lambda: fetch(season + "/constructorstandings.json"),
+        _constructors_fmt)
+    if val is not None:
+        out["constructors"] = val
+    if entry is not None:
+        _mark_stale(out, "constructors", entry)
+
+    def _results_raw():
         if lr is not None:
-            res = fetch("%s/%s/results.json" % (season, lr["round"]))
-        else:
-            # 休赛期:赛历已翻到次年,回退上一赛季收官战
-            res = fetch(str(int(season) - 1) + "/last/results.json")
+            return fetch("%s/%s/results.json" % (season, lr["round"]))
+        # 休赛期:赛历已翻到次年,回退上一赛季收官战
+        return fetch(str(int(season) - 1) + "/last/results.json")
+
+    def _results_fmt(res):
         races_res = res["MRData"]["RaceTable"]["Races"]
         if races_res:
-            out["last_results"] = fmt_results(races_res[0]["Results"])
-    except Exception:
-        pass
+            return fmt_results(races_res[0]["Results"])
+        return []
 
-    # 底部资讯盒三块(天气/巴萨/GitHub Trending):独立容错,失败留空对应盒子
+    val, entry = _cached_fetch("last_results", _results_raw, _results_fmt)
+    if val is not None:
+        out["last_results"] = val
+    if entry is not None:
+        _mark_stale(out, "last_results", entry)
+
+    # 底部资讯盒三块(天气/巴萨/GitHub Trending):同样走缓存,失败用上次好数据
     for key, getter in (("weather", get_weather), ("barca", get_barca),
                         ("trending", get_trending)):
-        try:
-            out[key] = getter()
-        except Exception as exc:
-            print("side panel %s failed: %r" % (key, repr(exc)[:60]))
+        val, entry = _cached_fetch(key, getter)
+        if val is not None:
+            out[key] = val
+        if entry is not None:
+            _mark_stale(out, key, entry)
     return out
 
 
@@ -856,8 +1022,13 @@ def _info_box(d, font, text, x0, x1, title, lines, y0=620, y1=778):
 
 
 def _draw_info_boxes(d, data, font, text):
-    """底部三资讯盒:每日天气 / 巴萨下一场 / GitHub Trending(数据已各自容错)。"""
+    """底部三资讯盒:每日天气 / 巴萨下一场 / GitHub Trending(数据已各自容错)。
+
+    数据过期时盒内末行附 "data as of MM-DD"(盒内最多 3 行正文,第 4 行
+    738px 处仍在盒内 778px 底边之上);无数据时不附(避免无中生有)。
+    """
     w, b, t = data.get("weather"), data.get("barca"), data.get("trending")
+    stale = data.get("stale") or {}
 
     wlines = []
     if w:
@@ -866,6 +1037,8 @@ def _draw_info_boxes(d, data, font, text):
         wlines = ["High %d°C  Low %d°C" % (today["high"], today["low"]),
                   "%s%s" % (today["text"], rain),
                   "Tomorrow %s %d°C" % (tom["text"], tom["high"])]
+        if stale.get("WEATHER"):
+            wlines.append("data as of %s" % stale["WEATHER"][1])
     _info_box(d, font, text, 28, 206, "%s TODAY" % (w["city"] if w else "WEATHER"),
               wlines)
 
@@ -877,6 +1050,8 @@ def _draw_info_boxes(d, data, font, text):
             blines.append(b["when"])
         if b["rank"]:
             blines.append("LaLiga %s · %d points" % (b["rank"], b["points"]))
+        if stale.get("BARCA"):
+            blines.append("data as of %s" % stale["BARCA"][1])
     _info_box(d, font, text, 218, 392, "FC BARCELONA", blines)
 
     tlines = []
@@ -885,6 +1060,8 @@ def _draw_info_boxes(d, data, font, text):
         tlines.append("%s stars today" % t["stars_today"])
         if t["lang"]:
             tlines.append("trending in %s" % t["lang"])
+        if stale.get("TRENDING"):
+            tlines.append("data as of %s" % stale["TRENDING"][1])
     _info_box(d, font, text, 404, 572, "GITHUB TRENDING", tlines)
 
 
@@ -907,13 +1084,18 @@ def _draw_dashboard(d, data, font, text):
                   anchor="ma", track=1)
 
     # 双积分榜 Top 5:标签牌 + 行列(无外框,点线引导)
+    # F1 数据过期时标签后附抓取日期(如 "· 11-20"),_fit 会缩字适配(最小 9)。
+    f1_stale = (data.get("stale") or {}).get("F1")
     for x0, x1, label, rows in (
             (28, 292, "DRIVER STANDINGS — TOP 5",
              [(p, surname(n), v) for p, n, v in data["standings"]]),
             (308, 572, "CONSTRUCTOR STANDINGS — TOP 5",
              [(p, n.upper(), v) for p, n, v in data["constructors"]])):
+        if f1_stale:
+            label = "%s · %s" % (label, f1_stale[1])
         d.rectangle([fs(x0), fy(84), fs(x1) - 1, fy(114) - 1], outline=0, width=lw(2))
-        text((x0 + x1) / 2, 99, label, font(True, _fit(d, font, label, x1 - x0 - 16, 13)),
+        text((x0 + x1) / 2, 99, label,
+             font(True, _fit(d, font, label, x1 - x0 - 16, 13, min_size=9)),
              anchor="mm")
         _standings_rows(d, font, text, x0, x1, rows, 132)
 
@@ -977,8 +1159,21 @@ def _poster_footer(d, data, font, text, nr):
     _season_ruler(d, 400, 520, 701, done, total, tick_w=3, tick_h=8)
     text(572, 698, "%d/%d" % (done, total), font(False, 14), fill=0, anchor="ra")
     d.line([fs(28), fy(768), fs(572), fy(768)], fill=GRAY_SOFT, width=lw(1))
-    _text_tracked(d, font, 28, 776, "LAST UPDATE %s" % data["upd"], 12,
-                  fill=0, track=1)
+    # 页脚:渲染时间 + 过期数据源角标(如 "· F1 11-20",即该组数据截至 11-20);
+    # 按实测宽度截断,超 544 设计区宽则不再加组(无过期数据时就是原来的行)。
+    line = "LAST UPDATE %s" % data["upd"]
+    stale = data.get("stale") or {}
+    for label in ("F1", "WEATHER", "BARCA", "TRENDING"):
+        if label not in stale:
+            continue
+        cand = "%s · %s %s" % (line, label, stale[label][1])
+        w = (sum(d.textlength(ch, font=font(False, 12)) for ch in cand)
+             / (FULL_SCALE * AA_SCALE) + 1 * len(cand))
+        if w <= 544:
+            line = cand
+        else:
+            break
+    _text_tracked(d, font, 28, 776, line, 12, fill=0, track=1)
 
 
 def _draw_poster(d, data, font, text):
@@ -1965,6 +2160,11 @@ def _execute_command(cmd):
     """
     global _REQUEST_EXIT
     action = cmd.get("action")
+    if not action or action == "none":
+        # 占位指令:静默 no-op,不执行、不报错。首装时 command.json 就是
+        # {"id": 0, "action": "none"},不能把它当成未知动作(2026-11-23
+        # 实测:首轮轮询把它当新指令执行,返回 unknown action 并写入失败)。
+        return {"action": "none", "ok": True, "note": "no-op"}
     try:
         if action == "refresh_now":
             t0 = time.time()
@@ -2067,8 +2267,10 @@ def _execute_command(cmd):
 def _poll_and_execute_command():
     """GET command.json;id 未变返回 {"action": "none"};新 id 执行并记录结果。
 
-    拉取失败返回 None(不断网重试,不断线)。执行结果写入 last_command.json,
-    供下次上报带回;执行本身永不抛异常。
+    占位指令 action=="none"(或缺失/空串)是静默 no-op:不执行、不写
+    last_command、不报错——首装 command.json 就是 {"id": 0, "action":
+    "none"}。拉取失败返回 None(不断网重试,不断线)。执行结果写入
+    last_command.json,供下次上报带回;执行本身永不抛异常。
     """
     try:
         cmd = _http_json(COMMAND_URL, timeout=15)
@@ -2086,6 +2288,19 @@ def _poll_and_execute_command():
             last["pending_report"] = False
             _write_last_command(last)
             return dict(last)
+        return {"action": "none", "id": cmd.get("id")}
+    # 新 id:先把上轮 update_code 挂着的 pending 结果带回一次(若有),
+    # 再处理本轮指令;避免 Muse 已把 command.json 复位成 none 时丢结果。
+    # 注意:下面返回 pending 结果时不执行本轮指令,本轮指令下轮仍是新 id,
+    # 会正常执行,不会丢。
+    if (last.get("action") in ("update_code", "pull_latest_code")
+            and last.get("pending_report")):
+        last["pending_report"] = False
+        _write_last_command(last)
+        return dict(last)
+    if not cmd.get("action") or cmd.get("action") == "none":
+        # 占位指令(首装 command.json 就是 {"id": 0, "action": "none"}):
+        # 不执行、不写 last_command、不报错;下次同 id 轮询仍走 no-op。
         return {"action": "none", "id": cmd.get("id")}
     res = _execute_command(cmd)
     res["id"] = cmd.get("id")
@@ -2662,6 +2877,7 @@ def mock_data(err=False, poster=False):
         "upd": "16:20",
         "upd_stamp": "11-14 16:20",
         "err": Exception("network unreachable") if err else None,
+        "stale": {},
     }
 
 
