@@ -82,6 +82,7 @@ REV=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 rsync -q kindle/f1dash.py "$HOST:$DIR/out/f1dash.py"
 ssh "$HOST" "python3 -c \"import json; json.dump({'sha256': '$SHA', 'version': '$REV', 'updated': __import__('time').strftime('%Y-%m-%dT%H:%M:%S+08:00', __import__('time').gmtime(__import__('time').time()+8*3600))}, open('$DIR/out/f1dash.version.json','w'))\" && \
   test -f $DIR/out/command.json || printf '%s' '{\"id\": 0, \"action\": \"none\"}' > $DIR/out/command.json && \
+  chmod 644 $DIR/out/f1dash.py $DIR/out/f1dash.version.json $DIR/out/command.json && \
   ls -l $DIR/out/f1dash.py $DIR/out/f1dash.version.json $DIR/out/command.json"
 
 echo "==> 完成。验证:"
