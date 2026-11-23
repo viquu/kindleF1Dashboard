@@ -75,13 +75,17 @@ ssh "$HOST" "sudo mv /tmp/f1dash-telemetry.service /etc/systemd/system/ && \
 ssh "$HOST" "sudo nginx -t"
 
 echo "==> 自更新发布件(Kindle 下一轮自检用;不碰生产渲染代码)"
-# f1dash.py 与版本清单放到 nginx 静态目录:Kindle 按清单 sha 自检,不同才下载。
+# f1dash.py 与版本清单放到 nginx 静态目录:Kindle 按清单验签→验 sha 自检,
+# 不同才下载。清单由 cloud/sign_release.py 生成(Ed25519 签名,私钥只在
+# Muse 的 VM 上,Ken 的 Mac 不参与签名——没有私钥的机器上跑这一步会直接
+# 失败退出,绝不发无签名版本,因为 Kindle 会以 bad_signature 拒绝它)。
 # command.json 只在缺失时建初始文件,已有指令绝不覆盖。
-SHA=$(sha256sum kindle/f1dash.py | cut -d' ' -f1)
 REV=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+python3 cloud/sign_release.py --in kindle/f1dash.py \
+  --out /tmp/f1dash.version.json --version "$REV"
 rsync -q kindle/f1dash.py "$HOST:$DIR/out/f1dash.py"
-ssh "$HOST" "python3 -c \"import json; json.dump({'sha256': '$SHA', 'version': '$REV', 'updated': __import__('time').strftime('%Y-%m-%dT%H:%M:%S+08:00', __import__('time').gmtime(__import__('time').time()+8*3600))}, open('$DIR/out/f1dash.version.json','w'))\" && \
-  test -f $DIR/out/command.json || printf '%s' '{\"id\": 0, \"action\": \"none\"}' > $DIR/out/command.json && \
+rsync -q /tmp/f1dash.version.json "$HOST:$DIR/out/f1dash.version.json"
+ssh "$HOST" "test -f $DIR/out/command.json || printf '%s' '{\"id\": 0, \"action\": \"none\"}' > $DIR/out/command.json && \
   chmod 644 $DIR/out/f1dash.py $DIR/out/f1dash.version.json $DIR/out/command.json && \
   ls -l $DIR/out/f1dash.py $DIR/out/f1dash.version.json $DIR/out/command.json"
 

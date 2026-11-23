@@ -36,6 +36,7 @@ framework 停了屏上看不到状态栏电量,拉图后本地把电量角标(�
 云端出图 + 唤醒即拉已足够实时。
 """
 
+import base64
 import calendar
 import hashlib
 import json
@@ -1714,6 +1715,12 @@ def current_ip():
 #     自己);装上这一版后,以后改 Kindle 端代码只需把新 f1dash.py + 版本
 #     清单放到 Oracle 的 out/ 目录,Kindle 下一轮自己校验、备份、替换、
 #     重启生效。校验失败/下载失败一律保留旧代码继续跑。
+#   代码签名(Ed25519):自更新走明文 HTTP,清单里的 sha 和文件都在同一台
+#     主机上,光验 sha 防不住 Oracle 被黑或中间人同时换文件+清单——所以
+#     清单里还有一份签名,私钥只在 Muse 的 VM 上(Ken 的 Mac 不参与),公
+#     钥写死在这份代码里(见 SIGNING_PUBLIC_KEY_HEX)。Kindle 先验签,签名
+#     不对直接拒绝,旧代码继续跑;验签通过才继续验 sha→编译→烟测→替换。
+#     公钥轮换只能人工重装(新公钥随新代码一起装),旧密钥签的版本一律拒绝。
 # 安全说明(v1):遥测接口与 latest.png 同等公开暴露(无鉴权),只收固定字
 # 段的 JSON、不执行任何客户端提供的内容、不把客户端给的路径当文件用;
 # 若以后要收紧,给 /api/ 加 token 再收。
@@ -1728,6 +1735,93 @@ _DAEMON_START = time.time()
 _REQUEST_EXIT = False
 # 最近一次自更新失败的原因(供 update_code 指令带回;成功/未开始时为 None)。
 _LAST_UPDATE_ERROR = None
+
+
+# ---------------- 自更新代码签名(Ed25519,纯标准库) ----------------
+# 信任根:公钥直接写进这份代码,首次人工安装时一并装上;私钥只在 Muse 的
+# VM 上(~/.config/kindle-signing/ed25519_private.key,0600),永不进仓库、
+# 永不上 Oracle、永不发给 Ken 的 Mac。Kindle 每次自更新先验签,签名不对
+# 直接拒绝,旧代码继续跑;验签通过才继续验 sha→编译→烟测→替换。公钥轮
+# 换只能人工重装(新公钥进新代码),旧密钥签的版本一律拒绝。
+# 验签代码是 cloud/ed25519.py 的 verify 子集(设备上只有验签,没有签名逻
+# 辑),test_signing.py 会拿 RFC 8032 向量同时测两边,改动要同步两处。
+# 验签只在真有新版时跑一次(sha 不一致才下载),平时每小时的检查到"已是
+# 最新"就返回,不验签、不耗电。
+SIGNING_PUBLIC_KEY_HEX = "f8d5f3ddbd402230710272f40380cf12c0a06519dabb4882e1347ebf539f0928"
+SIGNING_KEY_FINGERPRINT = "92f57f56f96f532d"  # sha256(公钥)前 16 位,供日志/清单核对
+_ED_Q = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+
+
+def _ed25519_verify(pubkey, message, sig):
+    """Ed25519 验签(纯 hashlib,无第三方库):签名有效 True,否则 False,永不抛异常。
+
+    签名是对文件字节本身的 Ed25519 签名,与清单/URL 无关——攻击者就算换
+    了清单里的 url、sha,也伪造不了签名。"""
+    try:
+        if len(sig) != 64 or len(pubkey) != 32:
+            return False
+        q = _ED_Q
+        d = -121665 * pow(121666, q - 2, q) % q
+        I = pow(2, (q - 1) // 4, q)
+
+        def inv(x):
+            return pow(x, q - 2, q)
+
+        def xrecover(y):
+            xx = (y * y - 1) * inv(d * y * y + 1)
+            x = pow(xx, (q + 3) // 8, q)
+            if (x * x - xx) % q != 0:
+                x = (x * I) % q
+            if x % 2 != 0:
+                x = q - x
+            return x
+
+        def edwards(P, Qpt):
+            x1, y1 = P
+            x2, y2 = Qpt
+            x3 = (x1 * y2 + x2 * y1) * inv(1 + d * x1 * x2 * y1 * y2)
+            # 曲线是 a=-1 的 twisted Edwards,y3 分子是 y1*y2 + x1*x2
+            # (a=+1 的公式是减号,写错会把所有点算出曲线外)。
+            y3 = (y1 * y2 + x1 * x2) * inv(1 - d * x1 * x2 * y1 * y2)
+            return [x3 % q, y3 % q]
+
+        def scalarmult(P, e):
+            if e == 0:
+                return [0, 1]
+            Qpt = scalarmult(P, e // 2)
+            Qpt = edwards(Qpt, Qpt)
+            if e & 1:
+                Qpt = edwards(Qpt, P)
+            return Qpt
+
+        def bit(h, i):
+            return (h[i // 8] >> (i % 8)) & 1
+
+        def decodepoint(s):
+            y = sum(2 ** i * bit(s, i) for i in range(0, 255))
+            x = xrecover(y)
+            if x & 1 != bit(s, 255):
+                x = q - x
+            if (-x * x + y * y - 1 - d * x * x * y * y) % q != 0:
+                raise ValueError("point not on curve")
+            return [x, y]
+
+        def Hint(m):
+            return int.from_bytes(hashlib.sha512(m).digest(), "little")
+
+        By = 4 * inv(5)
+        Bx = xrecover(By)
+        B = [Bx % q, By % q]
+        R = decodepoint(sig[:32])
+        A = decodepoint(pubkey)
+        S = int.from_bytes(sig[32:], "little")
+        if S >= _ED_L:
+            return False
+        h = Hint(sig[:32] + pubkey + message)
+        return scalarmult(B, S) == edwards(R, scalarmult(A, h))
+    except Exception:
+        return False
 
 
 def _sha256_file(path):
@@ -1862,8 +1956,9 @@ def _execute_command(cmd):
     update_code(别名 pull_latest_code)。
     set_mode= screensaver 与 reboot 必须带 confirm=true(前者会结束守护进程、
     后者会重启设备),缺失直接拒绝。update_code 不需要 confirm:它只走
-    _check_self_update 的同一条校验链(验 sha→py_compile→import 烟测),
-    任一步失败保留旧代码;已是最新版时返回 already_latest,不重启。
+    _check_self_update 的同一条校验链(验签→验 sha→py_compile→import 烟测),
+    任一步失败保留旧代码,签名失败时原因记 bad_signature;已是最新版时
+    返回 already_latest,不重启。
     注意:update 成功时 _check_self_update 会 exec 重启,本函数永不返回,
     所以成功结果要靠 on_before_restart 在重启前写进 last_command.json,
     新进程首轮 _poll_and_execute_command 会把它当作本轮指令结果带回上报。
@@ -2000,9 +2095,14 @@ def _poll_and_execute_command():
 
 
 def _check_self_update(allow_restart=True, on_before_restart=None):
-    """自更新:清单 sha 与本地不一致时,下载→验 sha→py_compile→import 烟测→
+    """自更新:清单 sha 与本地不一致时,下载→验签→验 sha→py_compile→import 烟测→
     备份(.bak)→原子替换→重启守护。任一步失败保留旧代码,只记日志,并把原因
     记到 _LAST_UPDATE_ERROR(供 update_code 指令带回)。
+
+    验签是第一道门,而且是唯一防中间人/Oracle 被黑的门:签名是对文件字节
+    的 Ed25519 签名,私钥只在 Muse 的 VM 上;清单缺签名、签名损坏、验签
+    失败一律记 bad_signature 并拒绝,连 sha 都不比。已是最新版时在下载前
+    就返回,不验签(没有新代码可装,也就没有可伪造的东西)。
 
     wifi_hold 存在时跳过(运维豁免)。allow_restart=False 时只做到"校验通过、
     已验证可替换"即返回 True(供测试),不替换、不重启。
@@ -2042,6 +2142,29 @@ def _check_self_update(allow_restart=True, on_before_restart=None):
     except Exception as exc:
         log("self-update: download failed: %r" % exc)
         _LAST_UPDATE_ERROR = "download failed"
+        return False
+    # 签名门:清单里的 signature 是对刚下载到的文件字节的 Ed25519 签名
+    # (与清单同主机、明文 HTTP 也无妨——伪造清单+文件仍过不了验签,因
+    # 为签名私钥不在 Oracle 上)。缺失/损坏/验签失败一律拒绝,旧代码继续
+    # 跑,原因记 bad_signature(供 update_code 带回)。
+    sig_b64 = manifest.get("signature")
+    if not sig_b64:
+        log("self-update: manifest has no signature, abort")
+        _LAST_UPDATE_ERROR = "bad_signature"
+        return False
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+    except Exception:
+        log("self-update: signature is not valid base64, abort")
+        _LAST_UPDATE_ERROR = "bad_signature"
+        return False
+    try:
+        pubkey = bytes.fromhex(SIGNING_PUBLIC_KEY_HEX)
+    except Exception:
+        pubkey = b""
+    if not _ed25519_verify(pubkey, blob, sig):
+        log("self-update: bad signature, abort")
+        _LAST_UPDATE_ERROR = "bad_signature"
         return False
     if hashlib.sha256(blob).hexdigest() != want_sha:
         log("self-update: sha256 mismatch, abort")
