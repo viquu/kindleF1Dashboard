@@ -1726,6 +1726,8 @@ LAST_COMMAND_FILE = "/mnt/us/f1dash/last_command.json"
 INTERVAL_OVERRIDE_FILE = "/mnt/us/f1dash/interval_override"
 _DAEMON_START = time.time()
 _REQUEST_EXIT = False
+# 最近一次自更新失败的原因(供 update_code 指令带回;成功/未开始时为 None)。
+_LAST_UPDATE_ERROR = None
 
 
 def _sha256_file(path):
@@ -1856,9 +1858,15 @@ def _read_interval_override(base):
 def _execute_command(cmd):
     """执行一条白名单指令,返回结果 dict;未知/非法动作只返回错误,永不抛异常。
 
-    动作:refresh_now | set_interval_seconds | set_mode | reboot。
+    动作:refresh_now | set_interval_seconds | set_mode | reboot |
+    update_code(别名 pull_latest_code)。
     set_mode= screensaver 与 reboot 必须带 confirm=true(前者会结束守护进程、
-    后者会重启设备),缺失直接拒绝。
+    后者会重启设备),缺失直接拒绝。update_code 不需要 confirm:它只走
+    _check_self_update 的同一条校验链(验 sha→py_compile→import 烟测),
+    任一步失败保留旧代码;已是最新版时返回 already_latest,不重启。
+    注意:update 成功时 _check_self_update 会 exec 重启,本函数永不返回,
+    所以成功结果要靠 on_before_restart 在重启前写进 last_command.json,
+    新进程首轮 _poll_and_execute_command 会把它当作本轮指令结果带回上报。
     """
     global _REQUEST_EXIT
     action = cmd.get("action")
@@ -1907,6 +1915,46 @@ def _execute_command(cmd):
                 return {"action": action, "ok": True, "mode": mode,
                         "note": "daemon exits after this cycle"}
             return {"action": action, "ok": False, "error": "unknown mode %r" % (mode,)}
+        if action in ("update_code", "pull_latest_code"):
+            # 按需拉最新代码:先查清单,已是最新直接返回不重启;有新版才走
+            # _check_self_update(同一条校验链,不绕过任何一步)。成功时对方
+            # exec 重启,本函数永不返回——成功结果已由 on_before_restart
+            # 在重启前写进 last_command.json(带 pending_report,新进程首轮
+            # 上报时带回;见 _poll_and_execute_command)。
+            if os.path.exists(WIFI_HOLD_FLAG):
+                return {"action": action, "ok": False, "updated": False,
+                        "reason": "wifi_hold"}
+            local = os.path.abspath(__file__)
+            cur = _sha256_file(local)
+            manifest = _http_json(SELF_UPDATE_MANIFEST_URL, timeout=15)
+            if not isinstance(manifest, dict):
+                return {"action": action, "ok": False, "updated": False,
+                        "old_sha": cur, "reason": "manifest fetch failed"}
+            want_sha = manifest.get("sha256")
+            if not want_sha:
+                return {"action": action, "ok": False, "updated": False,
+                        "old_sha": cur, "reason": "manifest has no sha256"}
+            if cur == want_sha:
+                return {"action": action, "ok": True, "updated": False,
+                        "old_sha": cur, "new_sha": want_sha,
+                        "version": manifest.get("version"),
+                        "reason": "already_latest"}
+            result = {"action": action, "ok": True, "updated": True,
+                      "old_sha": cur, "new_sha": want_sha,
+                      "version": manifest.get("version"),
+                      "id": cmd.get("id"), "pending_report": True}
+
+            def _record_update_result():
+                _write_last_command(result)
+
+            ok = _check_self_update(allow_restart=True,
+                                    on_before_restart=_record_update_result)
+            if not ok:
+                return {"action": action, "ok": False, "updated": False,
+                        "old_sha": cur, "new_sha": want_sha,
+                        "version": manifest.get("version"),
+                        "reason": _LAST_UPDATE_ERROR or "update failed"}
+            return result  # 成功时上面已 exec,到不了这里;仅作兜底
         if action == "reboot":
             if cmd.get("confirm") is not True:
                 return {"action": action, "ok": False, "error": "confirm=true required"}
@@ -1935,6 +1983,14 @@ def _poll_and_execute_command():
         return None
     last = _read_last_command()
     if last.get("id") == cmd.get("id"):
+        # update_code 成功时守护已 exec 重启,本轮上报没走成:上轮结果还
+        # 挂着 pending_report,本轮把它当作指令结果带回上报一次,之后清掉,
+        # 避免每小时重复报。其它指令仍按老语义返回 none(不重复执行)。
+        if (last.get("action") in ("update_code", "pull_latest_code")
+                and last.get("pending_report")):
+            last["pending_report"] = False
+            _write_last_command(last)
+            return dict(last)
         return {"action": "none", "id": cmd.get("id")}
     res = _execute_command(cmd)
     res["id"] = cmd.get("id")
@@ -1943,23 +1999,31 @@ def _poll_and_execute_command():
     return res
 
 
-def _check_self_update(allow_restart=True):
+def _check_self_update(allow_restart=True, on_before_restart=None):
     """自更新:清单 sha 与本地不一致时,下载→验 sha→py_compile→import 烟测→
-    备份(.bak)→原子替换→重启守护。任一步失败保留旧代码,只记日志。
+    备份(.bak)→原子替换→重启守护。任一步失败保留旧代码,只记日志,并把原因
+    记到 _LAST_UPDATE_ERROR(供 update_code 指令带回)。
 
     wifi_hold 存在时跳过(运维豁免)。allow_restart=False 时只做到"校验通过、
     已验证可替换"即返回 True(供测试),不替换、不重启。
     重启前删 pidfile,否则新进程启动时 main() 的 pid 检查会以为旧守护还在
-    跑而直接退出。
+    跑而直接退出。on_before_restart 在替换成功、exec 重启之前调用一次:
+    update_code 靠它在重启前把执行结果写进 last_command.json,否则 exec
+    后本轮永远走不到 _post_telemetry,结果就丢了;自动检查路径不传它。
     """
+    global _LAST_UPDATE_ERROR
+    _LAST_UPDATE_ERROR = None
     if os.path.exists(WIFI_HOLD_FLAG):
+        _LAST_UPDATE_ERROR = "wifi_hold"
         return False
     manifest = _http_json(SELF_UPDATE_MANIFEST_URL, timeout=15)
     if not isinstance(manifest, dict):
+        _LAST_UPDATE_ERROR = "manifest fetch failed"
         return False
     want_sha = manifest.get("sha256")
     if not want_sha:
         log("self-update: manifest has no sha256")
+        _LAST_UPDATE_ERROR = "manifest has no sha256"
         return False
     local = os.path.abspath(__file__)
     cur = _sha256_file(local)
@@ -1973,12 +2037,15 @@ def _check_self_update(allow_restart=True):
             blob = resp.read(2 * 1024 * 1024 + 1)
         if len(blob) > 2 * 1024 * 1024:
             log("self-update: download too large, abort")
+            _LAST_UPDATE_ERROR = "download too large"
             return False
     except Exception as exc:
         log("self-update: download failed: %r" % exc)
+        _LAST_UPDATE_ERROR = "download failed"
         return False
     if hashlib.sha256(blob).hexdigest() != want_sha:
         log("self-update: sha256 mismatch, abort")
+        _LAST_UPDATE_ERROR = "sha256 mismatch"
         return False
     new_path = local + ".new"
     try:
@@ -1989,6 +2056,7 @@ def _check_self_update(allow_restart=True):
         if r.returncode != 0:
             log("self-update: py_compile failed: %r" % (r.stderr[:100],))
             os.remove(new_path)
+            _LAST_UPDATE_ERROR = "py_compile failed"
             return False
         # import 烟测:在隔离目录以 f1dash.py 名导入新文件(顶层只定义常量/导入,
         # 不联网不碰硬件);失败同样丢弃。
@@ -2004,6 +2072,7 @@ def _check_self_update(allow_restart=True):
             if r.returncode != 0:
                 log("self-update: import smoke test failed: %r" % (r.stderr[:100],))
                 os.remove(new_path)
+                _LAST_UPDATE_ERROR = "import smoke test failed"
                 return False
         finally:
             shutil.rmtree(test_dir, ignore_errors=True)
@@ -2013,6 +2082,7 @@ def _check_self_update(allow_restart=True):
             os.remove(new_path)
         except Exception:
             pass
+        _LAST_UPDATE_ERROR = "verify failed"
         return False
     if not allow_restart:
         try:
@@ -2037,8 +2107,14 @@ def _check_self_update(allow_restart=True):
                                            time.gmtime(time.time() + 8 * 3600))}, f)
     except Exception as exc:
         log("self-update: replace failed: %r" % exc)
+        _LAST_UPDATE_ERROR = "replace failed"
         return False
     log("self-update: replaced %s -> %s, restarting daemon" % ((cur or "")[:8], want_sha[:8]))
+    if on_before_restart is not None:
+        try:
+            on_before_restart()
+        except Exception as exc:
+            log("self-update: on_before_restart failed: %r" % exc)
     try:
         os.remove("/var/run/f1dash_alwayson.pid")
     except Exception:
@@ -2118,6 +2194,8 @@ def always_cycle():
         log("ip: %s" % (current_ip() or "none"))
         # 遥测 + 远程指令 + 自更新(仅本轮联网时;任一步失败只记日志,不影响显示)。
         # 自更新版本有变且校验通过时直接 exec 重启,本函数不再返回。
+        # 自动自更新与 update_code 指令并存:前者每轮静默检查,后者按需立即
+        # 触发,走同一条校验链(update_code 只是多了显式结果和立即执行)。
         cmd_result = None
         if net:
             cmd_result = _poll_and_execute_command()
