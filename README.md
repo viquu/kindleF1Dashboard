@@ -37,7 +37,9 @@ F1 数据来自 [Jolpica F1](https://api.jolpi.ca)(原 Ergast API 的继任者,�
 
 - **信息牌模式**:设备休眠时屏保显示 F1 面板(零功耗);唤醒后自动下载云端成图(秒级)
 - **一键回睡(Auto Sleep)**:信息牌模式下按一下电源键 → Kindle 秒级拉取新图 → 自动回睡,锁屏永远是最新的;想正常阅读时在 KUAL 菜单切回 OFF
-- **常显模式(Always On)**:设备永不入睡,每小时拉云端成图 eips 全屏重显示,前置光强制关闭;与"信息牌+一键回睡"互补,是全天候实时版。Wi-Fi 常开不关(实测软关无效、硬关有断图风险),代价 ~30-60 mAh/h、基本一天一充(内置电池计量,`battreport` 外推)。拉图后本地把电量角标(电池图标 + 百分比 + 实测外推续航,≤15% 加顶部警告条)叠进右下角白边——framework 停了没有状态栏电量,屏上直接看还能撑多久
+- **常显模式(Always On)**:设备永不入睡,每小时拉云端成图 eips 全屏重显示,前置光强制关闭;与"信息牌+一键回睡"互补,是全天候实时版。Wi-Fi 整点硬开、拉图后保持 5 分钟窗口再硬关(2026-11-22 实测:软关 `lipc enable 0` 会被 wifid ~15s 翻回,三层硬关 `stop wifid + ifconfig down` 才可靠,28.72 mAh/h、约 32 小时一充)。拉图后本地把电量角标(电池图标 + 百分比 + 实测外推续航,≤15% 加顶部警告条)叠进右下角白边——framework 停了没有状态栏电量,屏上直接看还能撑多久
+- **遥测上报 + 远程指令(2026-11-23)**:Kindle 在内网、Muse 无法直接 SSH,所以方向反过来——Kindle 每轮拉图后 POST 一份遥测 JSON 到 Oracle(`POST /api/telemetry`,见 `cloud/telemetry_server.py`),Muse 用普通 HTTP GET `http://<host>:8080/f1/telemetry.json` 就能看到电量/放电速率/拉图结果;想遥控时 Muse 把 `command.json` 写到 Oracle 的 `/opt/f1dash/out/`,Kindle 下一轮顺手 GET,只有 id 变了才执行。白名单动作只有 `refresh_now`、`set_interval_seconds`(300–7200s)、`set_mode`、`reboot`(后两者须 `confirm: true`),永远不执行任意 shell,每次执行都记 `service.log` 并在下次上报带回结果
+- **自更新(2026-11-23)**:首装仍需人工 scp(旧代码里没有自更新逻辑);装上这一版后,改 Kindle 端代码只需把新 `f1dash.py` + `f1dash.version.json`(sha256)放到 Oracle 的 `/opt/f1dash/out/`(见 `cloud/deploy.sh` 的自更新发布件),Kindle 下一轮自己下载、验 sha、py_compile、import 烟测,通过才备份(`f1dash.py.bak`)、原子替换、重启守护;任一步失败保留旧代码继续跑。回滚:把 `.bak` 拷回原位,重跑 `always_on_stop.sh` + `always_on_start.sh`
 - **赛事周末海报**:距下一场开赛 **<3 天**(含比赛进行中)时,屏保自动切换为"赛事海报"版式——大号赛道轮廓、比赛名、地点与大字开赛时刻,替代日常信息密集的仪表盘;周末里排位赛/冲刺赛结束后**渐进**补出对应赛果(Top 5),正赛前信息更有用;赛程剩余 >3 天时自动回到仪表盘
 - **屏保内容(仪表盘)**:大字标题条(左上角小牌显示更新时刻,北京时间)、车手/车队积分榜 Top 5(点线引导)、下一场比赛面板(赛名、轮次、反色开赛时刻条、赛道轮廓图)、上场比赛领奖台 Top 3、底部资讯盒三联(杭州每日天气 / 巴萨下一场 LaLiga + 榜位 / GitHub Trending 今日第一仓)
 - **刷新屏保**:KUAL 里一键 Refresh Now(下载云端成图,秒级)
@@ -93,7 +95,7 @@ scp -r kindle/extensions/f1 root@<KINDLE_IP>:/mnt/us/extensions/
 | 场景 | 操作 |
 |---|---|
 | 当信息牌摆着 | KUAL → **Start Service** → **Auto Sleep 切到 ON** → 按电源键休眠,屏保显示面板;之后按一下电源键,它自己拉新图并回睡,锁屏始终最新 |
-| 全天候信息牌 | KUAL → **Always On 切到 ON**:设备自动停掉 framework + pillow(纯净全屏,无状态栏/对话框),每小时拉图,成图或电量有变才 eips 全屏重显示;Wi-Fi 常开不关(实测软关无效,见 f1dash.py `wifi()`)。**运行中 KUAL 不可用**,恢复阅读跑 `ssh kindle /mnt/us/extensions/f1/bin/always_on_stop.sh`(自动拉回 framework+pillow)或直接重启 Kindle |
+| 全天候信息牌 | KUAL → **Always On 切到 ON**:设备自动停掉 framework + pillow(纯净全屏,无状态栏/对话框),每小时拉图,成图或电量有变才 eips 全屏重显示;Wi-Fi 整点硬开、拉图后保持 5 分钟窗口(:00–:05 可 SSH/运维)再硬关,见 f1dash.py `wifi()`。**运行中 KUAL 不可用**,恢复阅读跑 `ssh kindle /mnt/us/extensions/f1/bin/always_on_stop.sh`(自动拉回 framework+pillow)或直接重启 Kindle |
 | 看电量/续航 | 常显屏右下角角标(成图或电量变化刷新时更新,含实测外推续航);想看完整报表再 `ssh kindle "/mnt/us/python3/bin/python3.9 /mnt/us/f1dash/f1dash.py battreport"`(采样 CSV 在 `/mnt/us/f1dash/battery.csv`;Wi-Fi 常开,SSH 随时可连) |
 | 正常阅读 | KUAL → **Auto Sleep 切到 OFF**,唤醒后不再自动回睡 |
 | 立即刷新屏保 | KUAL → **Refresh Now**(优先拉云端成图,下次休眠显示新图) |

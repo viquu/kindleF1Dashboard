@@ -1,0 +1,13 @@
+[Unit]
+Description=KPW1 telemetry receiver (Kindle POSTs JSON, Muse reads it over HTTP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/f1dash/venv/bin/python /opt/f1dash/telemetry_server.py
+Environment=F1DASH_OUT_DIR=/opt/f1dash/out
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

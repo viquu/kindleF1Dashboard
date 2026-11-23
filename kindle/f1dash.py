@@ -12,6 +12,8 @@
     f1dash.py service   守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新 + 可选一键回睡
     f1dash.py alwayson  常显守护:永不入睡,每小时拉图 → 叠加电量角标 → eips 全屏显示
     f1dash.py battreport  汇总常显期间电池采样 CSV,实测电流外推整块电池续航
+    f1dash.py telemetry  上报一份遥测 JSON 到 Oracle(电量/拉图/进程,见遥测一节)
+    f1dash.py command  拉取并执行 Oracle 上的 command.json(白名单动作,见遥测一节)
 
 架构:渲染已上移到 Oracle 云端(systemd timer 出图 + nginx 静态服务),
 Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十秒压到几秒;
@@ -35,9 +37,11 @@ framework 停了屏上看不到状态栏电量,拉图后本地把电量角标(�
 """
 
 import calendar
+import hashlib
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -1697,6 +1701,352 @@ def current_ip():
     return m.group(1) if m else None
 
 
+# ---------------- 遥测上报 + 远程指令 + 自更新 ----------------
+#
+# 背景:Muse 无法直接 SSH 到 Kindle(家里内网 NAT,无公网 IP,Tailscale 未接),
+# 而 Kindle 每小时都会主动找 Oracle 拉图 —— 方向反过来就通了:
+#   上报:Kindle 每轮拉图后 POST 一份遥测 JSON 到 Oracle,Muse 用普通 HTTP
+#     GET 就能看到电量/拉图结果,不用 SSH。
+#   指令:Muse 把 command.json 写到 Oracle 的 /opt/f1dash/out/(nginx 现成
+#     静态服务),Kindle 每轮拉图时顺手 GET,只有 id 变了才执行,执行结果下
+#     次上报带回。只允许白名单动作,永远不执行任意 shell。
+#   自更新:首装仍需人工 scp(当前跑着的旧代码里没有自更新逻辑,自己拉不到
+#     自己);装上这一版后,以后改 Kindle 端代码只需把新 f1dash.py + 版本
+#     清单放到 Oracle 的 out/ 目录,Kindle 下一轮自己校验、备份、替换、
+#     重启生效。校验失败/下载失败一律保留旧代码继续跑。
+# 安全说明(v1):遥测接口与 latest.png 同等公开暴露(无鉴权),只收固定字
+# 段的 JSON、不执行任何客户端提供的内容、不把客户端给的路径当文件用;
+# 若以后要收紧,给 /api/ 加 token 再收。
+
+TELEMETRY_URL = "http://149.118.42.190:8080/api/telemetry"
+COMMAND_URL = "http://149.118.42.190:8080/f1/command.json"
+SELF_UPDATE_MANIFEST_URL = "http://149.118.42.190:8080/f1/f1dash.version.json"
+SELF_UPDATE_URL = "http://149.118.42.190:8080/f1/f1dash.py"
+LAST_COMMAND_FILE = "/mnt/us/f1dash/last_command.json"
+INTERVAL_OVERRIDE_FILE = "/mnt/us/f1dash/interval_override"
+_DAEMON_START = time.time()
+_REQUEST_EXIT = False
+
+
+def _sha256_file(path):
+    """文件 SHA-256 hex;缺失/异常返回 None。"""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _http_json(url, payload=None, timeout=15):
+    """GET(无 payload)或 POST JSON;返回解析后的 dict,失败返回 None(不抛异常)。"""
+    try:
+        data = None
+        headers = {"User-Agent": "f1dash-telemetry/1.0", "Accept": "*/*"}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except Exception as exc:
+        log("http json %s failed: %r" % (url, repr(exc)[:80]))
+        return None
+
+
+def _telemetry_snapshot(extra=None):
+    """本轮遥测快照:电量/放电速率/Wi-Fi/拉图/进程/成图,全部 best-effort。"""
+    snap = {"ts": int(time.time()),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600)),
+            "mode": "alwayson",
+            "pid": os.getpid(),
+            "uptime_s": int(time.time() - _DAEMON_START),
+            "code_sha": (_sha256_file(os.path.abspath(__file__)) or "")[:12],
+            "wifi_up": _wlan_up(),
+            "ip": current_ip(),
+            "image_sha": (_sha256_file(SS_OUT) or "")[:12]}
+    try:
+        st = battery_status()
+    except Exception:
+        st = None
+    if st:
+        snap["battery_pct"] = st.get("pct")
+        snap["battery_mah"] = st.get("mah")
+        snap["charging"] = bool(st.get("charging"))
+        snap["days_left"] = st.get("days")
+    try:
+        snap["battery_mv"] = _sysfs_raw("battery_voltage")
+        snap["battery_lmd"] = _sysfs_raw("battery_lmd")
+    except Exception:
+        pass
+    # 放电速率:与 battery_status 同口径(最后一次守护重启后的非充电样本)
+    try:
+        rows, restarts = batt_rows(BATT_LOG)
+        now = time.time()
+        seg_start = max(now - 24 * 3600, restarts[-1] if restarts else 0.0)
+        disch = [r for r in rows if not r["chg"] and r["ts"] >= seg_start]
+        if len(disch) >= 2:
+            span_h = (disch[-1]["ts"] - disch[0]["ts"]) / 3600.0
+            used = disch[0]["mah"] - disch[-1]["mah"]
+            snap["drain_mah_h"] = round(used / span_h, 2) if span_h >= 1 and used > 0 else None
+        else:
+            snap["drain_mah_h"] = None
+    except Exception:
+        snap["drain_mah_h"] = None
+    try:
+        du = shutil.disk_usage("/mnt/us")
+        snap["disk_free_mb"] = round(du.free / 1024.0 / 1024.0, 1)
+    except Exception:
+        pass
+    if extra:
+        snap.update(extra)
+    return snap
+
+
+def _post_telemetry(extra=None):
+    """POST 一份遥测到 Oracle;成功 True,失败只记日志返回 False,永不抛异常。"""
+    try:
+        snap = _telemetry_snapshot(extra)
+        res = _http_json(TELEMETRY_URL, payload=snap, timeout=15)
+        if isinstance(res, dict) and res.get("ok"):
+            log("telemetry posted: pct=%s pull=%s" % (snap.get("battery_pct"),
+                                                      (extra or {}).get("pull_ok")))
+            return True
+        log("telemetry failed: bad response %r" % (res,)[:60])
+        return False
+    except Exception as exc:
+        log("telemetry failed: %r" % exc)
+        return False
+
+
+def _read_last_command():
+    try:
+        with open(LAST_COMMAND_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_last_command(cmd):
+    try:
+        tmp = LAST_COMMAND_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cmd, f)
+        os.replace(tmp, LAST_COMMAND_FILE)
+        return True
+    except Exception as exc:
+        log("last-command write failed: %r" % exc)
+        return False
+
+
+def _read_interval_override(base):
+    """每轮重读间隔覆盖文件(300-7200s 有效);无效/缺失返回 base。"""
+    try:
+        with open(INTERVAL_OVERRIDE_FILE) as f:
+            v = int(f.read().strip())
+        if 300 <= v <= 7200:
+            return v
+    except Exception:
+        pass
+    return base
+
+
+def _execute_command(cmd):
+    """执行一条白名单指令,返回结果 dict;未知/非法动作只返回错误,永不抛异常。
+
+    动作:refresh_now | set_interval_seconds | set_mode | reboot。
+    set_mode= screensaver 与 reboot 必须带 confirm=true(前者会结束守护进程、
+    后者会重启设备),缺失直接拒绝。
+    """
+    global _REQUEST_EXIT
+    action = cmd.get("action")
+    try:
+        if action == "refresh_now":
+            t0 = time.time()
+            ok = pull_image(outs=(SS_OUT,))
+            return {"action": action, "ok": bool(ok),
+                    "seconds": round(time.time() - t0, 1)}
+        if action == "set_interval_seconds":
+            try:
+                v = int(cmd.get("seconds", 0))
+            except (TypeError, ValueError):
+                return {"action": action, "ok": False, "error": "bad seconds"}
+            if not 300 <= v <= 7200:
+                return {"action": action, "ok": False, "error": "seconds out of range 300-7200"}
+            with open(INTERVAL_OVERRIDE_FILE, "w") as f:
+                f.write(str(v) + "\n")
+            return {"action": action, "ok": True, "seconds": v,
+                    "note": "applies from next cycle"}
+        if action == "set_mode":
+            if cmd.get("confirm") is not True:
+                return {"action": action, "ok": False, "error": "confirm=true required"}
+            mode = cmd.get("mode")
+            if mode == "alwayson":
+                return {"action": action, "ok": True, "mode": mode, "note": "already alwayson"}
+            if mode == "screensaver":
+                # 与 always_on_stop.sh 同语义:撤防入睡、拉回框架/pillow,退出守护;
+                # 退出后设备恢复正常睡眠,锁屏显示 SS_OUT(信息牌模式)。
+                keep_awake(False)
+                for job in ("framework", "pillow"):
+                    try:
+                        subprocess.run(["/sbin/start", job], capture_output=True, timeout=10)
+                    except Exception:
+                        try:
+                            subprocess.run(["start", job], capture_output=True, timeout=10)
+                        except Exception as exc:
+                            log("set_mode screensaver: start %s failed: %r" % (job, exc))
+                try:
+                    subprocess.run(["lipc-set-prop", "com.lab126.powerd",
+                                    "preventScreenSaver", "0"],
+                                   capture_output=True, timeout=5)
+                except Exception:
+                    pass
+                _REQUEST_EXIT = True
+                return {"action": action, "ok": True, "mode": mode,
+                        "note": "daemon exits after this cycle"}
+            return {"action": action, "ok": False, "error": "unknown mode %r" % (mode,)}
+        if action == "reboot":
+            if cmd.get("confirm") is not True:
+                return {"action": action, "ok": False, "error": "confirm=true required"}
+            log("command: reboot confirmed, rebooting now")
+            try:
+                subprocess.run(["reboot"], timeout=10)
+            except Exception as exc:
+                return {"action": action, "ok": False, "error": repr(exc)[:60]}
+            return {"action": action, "ok": True}
+        return {"action": action, "ok": False, "error": "unknown action"}
+    except Exception as exc:
+        return {"action": action, "ok": False, "error": repr(exc)[:80]}
+
+
+def _poll_and_execute_command():
+    """GET command.json;id 未变返回 {"action": "none"};新 id 执行并记录结果。
+
+    拉取失败返回 None(不断网重试,不断线)。执行结果写入 last_command.json,
+    供下次上报带回;执行本身永不抛异常。
+    """
+    try:
+        cmd = _http_json(COMMAND_URL, timeout=15)
+    except Exception:
+        return None
+    if not isinstance(cmd, dict) or "id" not in cmd:
+        return None
+    last = _read_last_command()
+    if last.get("id") == cmd.get("id"):
+        return {"action": "none", "id": cmd.get("id")}
+    res = _execute_command(cmd)
+    res["id"] = cmd.get("id")
+    _write_last_command(res)
+    log("command executed: %r" % (res,)[:120])
+    return res
+
+
+def _check_self_update(allow_restart=True):
+    """自更新:清单 sha 与本地不一致时,下载→验 sha→py_compile→import 烟测→
+    备份(.bak)→原子替换→重启守护。任一步失败保留旧代码,只记日志。
+
+    wifi_hold 存在时跳过(运维豁免)。allow_restart=False 时只做到"校验通过、
+    已验证可替换"即返回 True(供测试),不替换、不重启。
+    重启前删 pidfile,否则新进程启动时 main() 的 pid 检查会以为旧守护还在
+    跑而直接退出。
+    """
+    if os.path.exists(WIFI_HOLD_FLAG):
+        return False
+    manifest = _http_json(SELF_UPDATE_MANIFEST_URL, timeout=15)
+    if not isinstance(manifest, dict):
+        return False
+    want_sha = manifest.get("sha256")
+    if not want_sha:
+        log("self-update: manifest has no sha256")
+        return False
+    local = os.path.abspath(__file__)
+    cur = _sha256_file(local)
+    if cur == want_sha:
+        return False
+    url = manifest.get("url") or SELF_UPDATE_URL
+    log("self-update: %s -> %s" % ((cur or "")[:8], want_sha[:8]))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "f1dash-telemetry/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            blob = resp.read(2 * 1024 * 1024 + 1)
+        if len(blob) > 2 * 1024 * 1024:
+            log("self-update: download too large, abort")
+            return False
+    except Exception as exc:
+        log("self-update: download failed: %r" % exc)
+        return False
+    if hashlib.sha256(blob).hexdigest() != want_sha:
+        log("self-update: sha256 mismatch, abort")
+        return False
+    new_path = local + ".new"
+    try:
+        with open(new_path, "wb") as f:
+            f.write(blob)
+        r = subprocess.run([sys.executable, "-m", "py_compile", new_path],
+                           capture_output=True, timeout=60)
+        if r.returncode != 0:
+            log("self-update: py_compile failed: %r" % (r.stderr[:100],))
+            os.remove(new_path)
+            return False
+        # import 烟测:在隔离目录以 f1dash.py 名导入新文件(顶层只定义常量/导入,
+        # 不联网不碰硬件);失败同样丢弃。
+        test_dir = "/tmp/_upd_test"
+        try:
+            os.makedirs(test_dir, exist_ok=True)
+            shutil.copyfile(new_path, os.path.join(test_dir, "f1dash.py"))
+            r = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; sys.path.insert(0, '/tmp/_upd_test');"
+                 "import f1dash; print('import ok', f1dash.SS_SIZE)"],
+                capture_output=True, timeout=60, cwd=test_dir)
+            if r.returncode != 0:
+                log("self-update: import smoke test failed: %r" % (r.stderr[:100],))
+                os.remove(new_path)
+                return False
+        finally:
+            shutil.rmtree(test_dir, ignore_errors=True)
+    except Exception as exc:
+        log("self-update: verify failed: %r" % exc)
+        try:
+            os.remove(new_path)
+        except Exception:
+            pass
+        return False
+    if not allow_restart:
+        try:
+            os.remove(new_path)
+        except Exception:
+            pass
+        log("self-update: verified, restart deferred (test mode)")
+        return True
+    # 备份→原子替换(第二步失败把 .bak 搬回),写 marker,删 pidfile 后 exec 重启。
+    bak = local + ".bak"
+    try:
+        os.replace(local, bak)
+        try:
+            os.replace(new_path, local)
+        except Exception:
+            os.replace(bak, local)
+            raise
+        with open(local + ".update.json", "w") as f:
+            json.dump({"from": cur, "to": want_sha,
+                       "version": manifest.get("version"),
+                       "at": time.strftime("%Y-%m-%d %H:%M:%S",
+                                           time.gmtime(time.time() + 8 * 3600))}, f)
+    except Exception as exc:
+        log("self-update: replace failed: %r" % exc)
+        return False
+    log("self-update: replaced %s -> %s, restarting daemon" % ((cur or "")[:8], want_sha[:8]))
+    try:
+        os.remove("/var/run/f1dash_alwayson.pid")
+    except Exception:
+        pass
+    os.execv(sys.executable, [sys.executable, local] + sys.argv[1:])
+    return True
+
+
 def always_cycle():
     """一轮常显刷新:巡检 dropbear → Wi-Fi 硬开 → 拉图 → 图/电量有变才显示 → finally 保持开窗后硬关。
 
@@ -1720,10 +2070,13 @@ def always_cycle():
     wifi(True)
     net = pulled = False
     cap = "?"
+    t_reconnect = None
+    t_pull = None
     try:
         t_net = time.time()
         net = wait_network()
         if net:
+            t_reconnect = round(time.time() - t_net, 1)
             log("cycle: wifi up, route in %.0fs" % (time.time() - t_net))
         else:
             log("cycle: no network; retry wifi start sequence")
@@ -1731,10 +2084,13 @@ def always_cycle():
             t_net = time.time()
             net = wait_network(45)
             if net:
+                t_reconnect = round(time.time() - t_net, 1)
                 log("cycle: wifi up on retry, route in %.0fs" % (time.time() - t_net))
         prev = _read_bytes(SS_OUT)
         if net:
+            _t_pull0 = time.time()
             pulled = pull_image(outs=(SS_OUT,))
+            t_pull = round(time.time() - _t_pull0, 1)
             if not pulled:
                 log("cycle: pull failed; keep last image")
         else:
@@ -1760,6 +2116,16 @@ def always_cycle():
         else:
             log("cycle: image and battery unchanged; skip eips refresh")
         log("ip: %s" % (current_ip() or "none"))
+        # 遥测 + 远程指令 + 自更新(仅本轮联网时;任一步失败只记日志,不影响显示)。
+        # 自更新版本有变且校验通过时直接 exec 重启,本函数不再返回。
+        cmd_result = None
+        if net:
+            cmd_result = _poll_and_execute_command()
+            if pulled:
+                _check_self_update()
+        _post_telemetry({"pull_ok": pulled, "net_ok": net,
+                         "reconnect_s": t_reconnect, "pull_s": t_pull,
+                         "command": cmd_result, "battery": cap or "?"})
     finally:
         if pulled:
             _wifi_fail_streak = 0
@@ -1829,6 +2195,10 @@ def always_on_mode(interval=None):
     front_light_off()   # 停框架之后:停机会重套滑块亮度,先停再灭
     always_cycle()
     while True:
+        if _REQUEST_EXIT:
+            log("always-on exiting on remote command (set_mode screensaver)")
+            return
+        interval = _read_interval_override(interval)
         nap = _next_grid_sleep(interval)
         t0 = time.time()
         time.sleep(nap)
@@ -2123,6 +2493,12 @@ def main():
         return 0
     if mode == "battreport":
         return battreport()
+    if mode == "telemetry":
+        return 0 if _post_telemetry({"manual": True}) else 1
+    if mode == "command":
+        res = _poll_and_execute_command()
+        print(res)
+        return 0 if res is not None else 1
     if mode == "pull":
         return 0 if pull_screensaver(out=out) else 1
     if mode == "refresh":

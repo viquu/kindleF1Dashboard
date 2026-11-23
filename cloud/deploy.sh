@@ -65,6 +65,25 @@ if command -v netfilter-persistent >/dev/null 2>&1; then
 fi
 REMOTE
 
+echo "==> 遥测接收端(telemetry_server.py + systemd + nginx /api/ 代理)"
+rsync -q cloud/telemetry_server.py "$HOST:$DIR/telemetry_server.py"
+rsync -q cloud/systemd/f1dash-telemetry.service "$HOST:/tmp/"
+ssh "$HOST" "sudo mv /tmp/f1dash-telemetry.service /etc/systemd/system/ && \
+  sudo systemctl daemon-reload && \
+  sudo systemctl enable --now f1dash-telemetry.service"
+# nginx 配置已含 /api/ 代理(上面已同步并 reload);下面只做一次配置校验
+ssh "$HOST" "sudo nginx -t"
+
+echo "==> 自更新发布件(Kindle 下一轮自检用;不碰生产渲染代码)"
+# f1dash.py 与版本清单放到 nginx 静态目录:Kindle 按清单 sha 自检,不同才下载。
+# command.json 只在缺失时建初始文件,已有指令绝不覆盖。
+SHA=$(sha256sum kindle/f1dash.py | cut -d' ' -f1)
+REV=$(git rev-parse HEAD 2>/dev/null || echo unknown)
+rsync -q kindle/f1dash.py "$HOST:$DIR/out/f1dash.py"
+ssh "$HOST" "python3 -c \"import json; json.dump({'sha256': '$SHA', 'version': '$REV', 'updated': __import__('time').strftime('%Y-%m-%dT%H:%M:%S+08:00', __import__('time').gmtime(__import__('time').time()+8*3600))}, open('$DIR/out/f1dash.version.json','w'))\" && \
+  test -f $DIR/out/command.json || printf '%s' '{\"id\": 0, \"action\": \"none\"}' > $DIR/out/command.json && \
+  ls -l $DIR/out/f1dash.py $DIR/out/f1dash.version.json $DIR/out/command.json"
+
 echo "==> 完成。验证:"
 ssh "$HOST" "systemctl list-timers f1dash-render.timer --no-pager | head -3; \
   ls -la /opt/f1dash/out/; systemctl status f1dash-render.service --no-pager -n 5 | tail -8"
