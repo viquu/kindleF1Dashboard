@@ -111,7 +111,17 @@ SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 # ---------------- 云端成图(Oracle 渲染,Kindle 下载) ----------------
 
 CLOUD_URL = "http://149.118.42.190:8080/f1/latest.png"
-PULL_TIMEOUT = 25  # 下载成图(~100KB)的宽限秒数
+# 2026-11-23 实测:Kindle 拉图 20:03 38.4s、21:02 26.7s、22:00 29.6s
+# 三次失败都只比旧 25s 超时多一点,22:12 一次 10.7s 成功——下载一直在
+# 走,只是某次 recv 会卡住 ~25s(单次 socket 超时)然后断开。链路有效
+# 速度约 2-3KB/s,32KB 的图要 ~16s;90s 预算容得下一次长卡顿,加一次
+# 重试后基本能覆盖观测到的失败模式,比 25s 时的"卡一次就丢一轮"稳得多。
+PULL_TIMEOUT = 90  # 下载成图(~100KB,常显图约 32KB)的宽限秒数
+# 自更新代码下载(~166KB)的宽限秒数。2026-11-23 22:12 实测:22:12 的
+# update_code 拿到 155365/166239 字节(93.5%)后 60s 超时断开;166KB
+# 按 ~2KB/s 要 ~83s,180s 给 2 倍余量。2MB 上限与验签/sha/编译/烟测
+# 门不变(见 _check_self_update)。
+CODE_DOWNLOAD_TIMEOUT = 180
 AUTO_SLEEP_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auto_sleep")
 
 
@@ -120,13 +130,24 @@ def pull_image(url=CLOUD_URL, outs=(SS_OUT,)):
 
     校验 PNG 魔数,防止错误页/半截响应覆盖;与已有文件字节相同则跳过写盘。
     常显模式一次下载同时更新 eips 显示图与 linkss 锁屏图。
+
+    下载失败重试一次(新建连接,间隔 2s):Kindle 链路常出现单次 recv 长
+    卡顿后断开,换一个新连接往往就能走完(2026-11-23 观测:三次 26-38s
+    失败后一次 10.7s 成功)。非 PNG 响应不重试——那是服务端内容问题,
+    重试也一样。
     """
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "f1dash-kindle"})
-        with urllib.request.urlopen(req, timeout=PULL_TIMEOUT) as resp:
-            data = resp.read()
-    except Exception as exc:
-        print("pull failed:", repr(exc)[:80])
+    data = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "f1dash-kindle"})
+            with urllib.request.urlopen(req, timeout=PULL_TIMEOUT) as resp:
+                data = resp.read()
+            break
+        except Exception as exc:
+            print("pull failed (attempt %d/2):" % attempt, repr(exc)[:80])
+            if attempt == 1:
+                time.sleep(2)  # 换新连接前稍等,让链路抖动过去
+    if data is None:
         return False
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         print("pull failed: not a PNG (%d bytes)" % len(data))
@@ -1518,7 +1539,15 @@ def _finish_canvas(img, out):
     # 保留中深灰阶 —— 深灰在 e-ink 量化稳定(发虚的是 180-240 浅灰,已被排除),
     # 电量角标同为灰度直出,屏上边缘实测平滑。出图仍 758x1024 8-bit 灰度。
     img = img.point(lambda p: 0 if p < 64 else (255 if p > 160 else p))
-    img.save(out)
+    # 原子落盘:先写 tmp 再 os.replace,避免云端每 10 分钟重渲染保存时
+    # Kindle 正好在下载,读到半截文件(2026-11-23 诊断:nginx 当时都
+    # 给了完整字节数, stalls 的主因是链路卡顿,这是次要隐患,但修起来
+    # 便宜;同文件别处已用此模式,如电池角标与 pull_image)。
+    tmp = out + ".tmp"
+    # 注意:format 必须显式传 PNG——".tmp" 后缀 PIL 猜不出格式,不传会
+    # 抛 ValueError: unknown file extension。
+    img.save(tmp, format="PNG")
+    os.replace(tmp, out)
     print("saved:", out, img.size, img.mode)
     return True
 
@@ -3141,7 +3170,7 @@ def _check_self_update(allow_restart=True, on_before_restart=None,
     log("self-update: %s -> %s" % ((cur or "")[:8], want_sha[:8]))
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "f1dash-telemetry/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=CODE_DOWNLOAD_TIMEOUT) as resp:
             blob = resp.read(2 * 1024 * 1024 + 1)
         if len(blob) > 2 * 1024 * 1024:
             log("self-update: download too large, abort")
