@@ -2580,6 +2580,7 @@ def current_ip():
 # 若以后要收紧,给 /api/ 加 token 再收。
 
 TELEMETRY_URL = "http://149.118.42.190:8080/api/telemetry"
+LOG_URL = "http://149.118.42.190:8080/api/log"
 COMMAND_URL = "http://149.118.42.190:8080/f1/command.json"
 SELF_UPDATE_MANIFEST_URL = "http://149.118.42.190:8080/f1/f1dash.version.json"
 SELF_UPDATE_URL = "http://149.118.42.190:8080/f1/f1dash.py"
@@ -2771,6 +2772,84 @@ def _post_telemetry(extra=None):
         return False
 
 
+def _sanitize_log_line(line):
+    """日志行脱敏+截断:service.log 按设计不含任何凭据(本函数是第二道防线)。
+
+    每行截到 200 字符;password=/token=/secret= 这类键值对只留键名,值抹掉。
+    验签只记公钥指纹(公开值),私钥永不进日志——grep 全仓也找不到它。"""
+    line = line.rstrip("\n")[:200]
+    for key in ("password", "passwd", "token", "secret", "api_key", "private"):
+        lower = line.lower()
+        idx = lower.find(key + "=")
+        if idx >= 0:
+            line = line[:idx + len(key) + 1] + "***"
+    return line
+
+
+def _read_log_tail(path, n, max_bytes=100 * 1024):
+    """读日志尾 n 行(脱敏后);文件缺失/超大/异常返回 []。"""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            return []
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()[-n:]
+        return [_sanitize_log_line(l) for l in lines]
+    except Exception:
+        return []
+
+
+def _upload_log():
+    """上传日志尾到 Oracle /api/log:service.log 后 50 行 + battery.csv 后 20 行。
+
+    总负载 <64KB(nginx client_max_body_size 64k),超了先砍 battery.csv 再砍
+    log 行。成功返回 {"action": "upload_log", "ok": True, "lines": N},
+    失败只返回错误、永不抛异常。"""
+    try:
+        lines = _read_log_tail(SERVICE_LOG, 50)
+        batt = _read_log_tail(BATT_LOG, 20)
+        payload = {"ts": int(time.time()),
+                   "time": time.strftime("%Y-%m-%d %H:%M:%S",
+                                         time.gmtime(time.time() + 8 * 3600)),
+                   "code_sha": (_sha256_file(os.path.abspath(__file__)) or "")[:12],
+                   "log": lines, "battery_csv": batt}
+        while len(json.dumps(payload).encode("utf-8")) > 60 * 1024 and lines:
+            lines = lines[1:]
+            payload["log"] = lines
+        if len(json.dumps(payload).encode("utf-8")) > 60 * 1024:
+            payload["battery_csv"] = []
+        res = _http_json(LOG_URL, payload=payload, timeout=15)
+        if isinstance(res, dict) and res.get("ok"):
+            log("log uploaded: %d lines" % len(lines))
+            return {"action": "upload_log", "ok": True, "lines": len(lines)}
+        log("log upload failed: bad response %r" % (res,)[:60])
+        return {"action": "upload_log", "ok": False, "error": "bad response"}
+    except Exception as exc:
+        log("log upload failed: %r" % exc)
+        return {"action": "upload_log", "ok": False, "error": repr(exc)[:80]}
+
+
+def _maybe_auto_upload_log():
+    """自更新重启后首轮自动上传一次日志尾(诊断跟着代码更新走,不用再下一条指令)。
+
+    触发条件:_check_self_update 写下的 .update.json 标记存在。上传成功才删
+    标记(只传一次);失败则留到下一轮再试——诊断不能因为一次 POST 失败就丢
+    了,每轮也只试一次,不会刷屏。返回上传结果 dict 或 None(无标记)。"""
+    marker = os.path.abspath(__file__) + ".update.json"
+    if not os.path.exists(marker):
+        return None
+    try:
+        res = _upload_log()
+    except Exception as exc:
+        res = {"action": "upload_log", "ok": False, "error": repr(exc)[:80]}
+    if res.get("ok"):
+        try:
+            os.remove(marker)
+        except Exception:
+            pass
+    log("auto log upload after update: %r" % (res,)[:120])
+    return res
+
+
 def _read_last_command():
     try:
         with open(LAST_COMMAND_FILE) as f:
@@ -2807,7 +2886,10 @@ def _execute_command(cmd):
     """执行一条白名单指令,返回结果 dict;未知/非法动作只返回错误,永不抛异常。
 
     动作:refresh_now | set_interval_seconds | set_mode | reboot |
-    update_code(别名 pull_latest_code)。
+    update_code(别名 pull_latest_code) | upload_log(别名 fetch_log)。
+    upload_log 把 service.log 后 50 行 + battery.csv 后 20 行 POST 到
+    Oracle /api/log,成功才算 ok,结果下次上报带回;自更新重启后首轮还会
+    自动上传一次(见 _maybe_auto_upload_log),不用再下一条指令。
     set_mode= screensaver 与 reboot 必须带 confirm=true(前者会结束守护进程、
     后者会重启设备),缺失直接拒绝。update_code 不需要 confirm:它只走
     _check_self_update 的同一条校验链(验签→验 sha→py_compile→import 烟测),
@@ -2909,6 +2991,8 @@ def _execute_command(cmd):
                         "version": manifest.get("version"),
                         "reason": _LAST_UPDATE_ERROR or "update failed"}
             return result  # 成功时上面已 exec,到不了这里;仅作兜底
+        if action in ("upload_log", "fetch_log"):
+            return _upload_log()
         if action == "reboot":
             if cmd.get("confirm") is not True:
                 return {"action": action, "ok": False, "error": "confirm=true required"}
@@ -3201,6 +3285,10 @@ def always_cycle():
         _post_telemetry({"pull_ok": pulled, "net_ok": net,
                          "reconnect_s": t_reconnect, "pull_s": t_pull,
                          "command": cmd_result, "battery": cap or "?"})
+        # 自更新重启后首轮:自动上传一次日志尾(诊断跟着代码更新走)。
+        # 标记在 _check_self_update 替换成功时写下,上传成功才删,只传一次。
+        if net:
+            _maybe_auto_upload_log()
     finally:
         if pulled:
             _wifi_fail_streak = 0
