@@ -2717,7 +2717,10 @@ def _telemetry_snapshot(extra=None):
             "code_sha": (_sha256_file(os.path.abspath(__file__)) or "")[:12],
             "wifi_up": _wlan_up(),
             "ip": current_ip(),
-            "image_sha": (_sha256_file(SS_OUT) or "")[:12]}
+            "image_sha": (_sha256_file(SS_OUT) or "")[:12],
+            # 调试模式状态:Muse 从上报一眼看出设备是不是还在调试态,不用猜。
+            "debug": os.path.exists(WIFI_HOLD_FLAG),
+            "interval_seconds": _read_interval_override(ALWAYS_INTERVAL)}
     try:
         st = battery_status()
     except Exception:
@@ -2886,7 +2889,9 @@ def _execute_command(cmd):
     """执行一条白名单指令,返回结果 dict;未知/非法动作只返回错误,永不抛异常。
 
     动作:refresh_now | set_interval_seconds | set_mode | reboot |
-    update_code(别名 pull_latest_code) | upload_log(别名 fetch_log)。
+    update_code(别名 pull_latest_code) | upload_log(别名 fetch_log) |
+    set_debug。set_debug 调试模式:debug=true 时 Wi-Fi 常开 + 5 分钟一轮
+    (不用等整点 5 分钟窗口),只在插电时用;debug=false 恢复每小时。
     upload_log 把 service.log 后 50 行 + battery.csv 后 20 行 POST 到
     Oracle /api/log,成功才算 ok,结果下次上报带回;自更新重启后首轮还会
     自动上传一次(见 _maybe_auto_upload_log),不用再下一条指令。
@@ -2923,6 +2928,40 @@ def _execute_command(cmd):
                 f.write(str(v) + "\n")
             return {"action": action, "ok": True, "seconds": v,
                     "note": "applies from next cycle"}
+        if action == "set_debug":
+            # 远程调试模式:Wi-Fi 常开 + 5 分钟一轮,调试不用等整点 5 分钟窗口。
+            # 实现就是已有的两件套:wifi_hold 标志(本轮豁免硬关)+ interval
+            # 覆盖 300s(每轮重读,下一轮即生效,重启后文件还在故调试态可跨
+            # 代码更新保持)。只在插电时用:Wi-Fi 常开比硬关多约 13% 耗电
+            # (实测无线电成本约 4.4 mAh/h)。debug 必须是 JSON 布尔值,
+            # 其它一律拒绝。
+            debug = cmd.get("debug")
+            if debug is True:
+                try:
+                    with open(WIFI_HOLD_FLAG, "w") as f:
+                        f.write("debug\n")
+                    with open(INTERVAL_OVERRIDE_FILE, "w") as f:
+                        f.write("300\n")
+                except Exception as exc:
+                    return {"action": action, "ok": False,
+                            "error": repr(exc)[:60]}
+                log("command: debug mode on (wifi hold, 300s interval)")
+                return {"action": action, "ok": True, "debug": True,
+                        "interval_seconds": 300, "wifi_hold": True,
+                        "note": "wifi stays on, 5-min cycles; "
+                                "set_debug false to exit"}
+            if debug is False:
+                for p in (WIFI_HOLD_FLAG, INTERVAL_OVERRIDE_FILE):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                log("command: debug mode off (hourly cycles restored)")
+                return {"action": action, "ok": True, "debug": False,
+                        "interval_seconds": 3600, "wifi_hold": False,
+                        "note": "hourly cycles restored"}
+            return {"action": action, "ok": False,
+                    "error": "debug must be true or false"}
         if action == "set_mode":
             if cmd.get("confirm") is not True:
                 return {"action": action, "ok": False, "error": "confirm=true required"}
@@ -2957,9 +2996,9 @@ def _execute_command(cmd):
             # exec 重启,本函数永不返回——成功结果已由 on_before_restart
             # 在重启前写进 last_command.json(带 pending_report,新进程首轮
             # 上报时带回;见 _poll_and_execute_command)。
-            if os.path.exists(WIFI_HOLD_FLAG):
-                return {"action": action, "ok": False, "updated": False,
-                        "reason": "wifi_hold"}
+            # 显式 update_code 不受 wifi_hold 阻挡(见 _check_self_update
+            # 的 explicit 参数):调试模式下 wifi_hold 常在,挡住它就等于
+            # 调试模式收不到代码更新——正是调试要做的事。
             local = os.path.abspath(__file__)
             cur = _sha256_file(local)
             manifest = _http_json(SELF_UPDATE_MANIFEST_URL, timeout=15)
@@ -2983,7 +3022,7 @@ def _execute_command(cmd):
             def _record_update_result():
                 _write_last_command(result)
 
-            ok = _check_self_update(allow_restart=True,
+            ok = _check_self_update(allow_restart=True, explicit=True,
                                     on_before_restart=_record_update_result)
             if not ok:
                 return {"action": action, "ok": False, "updated": False,
@@ -3052,7 +3091,8 @@ def _poll_and_execute_command():
     return res
 
 
-def _check_self_update(allow_restart=True, on_before_restart=None):
+def _check_self_update(allow_restart=True, on_before_restart=None,
+                       explicit=False):
     """自更新:清单 sha 与本地不一致时,下载→验签→验 sha→py_compile→import 烟测→
     备份(.bak)→原子替换→重启守护。任一步失败保留旧代码,只记日志,并把原因
     记到 _LAST_UPDATE_ERROR(供 update_code 指令带回)。
@@ -3062,8 +3102,15 @@ def _check_self_update(allow_restart=True, on_before_restart=None):
     失败一律记 bad_signature 并拒绝,连 sha 都不比。已是最新版时在下载前
     就返回,不验签(没有新代码可装,也就没有可伪造的东西)。
 
-    wifi_hold 存在时跳过(运维豁免)。allow_restart=False 时只做到"校验通过、
-    已验证可替换"即返回 True(供测试),不替换、不重启。
+    wifi_hold 存在时跳过(运维豁免)——只限自动检查(explicit=False)。
+    显式更新(explicit=True,只来自 update_code 指令)不受 wifi_hold 阻挡:
+    wifi_hold 的本意是保护正在 SSH 上手动运维的人,自动自更新半路 exec
+    重启会断掉他的会话/工作,所以没人要求的自动检查遇到它就跳过;但显式
+    指令是运维者本人要求立即更新,重启正是预期结果。调试模式下 wifi_hold
+    常在,若显式更新也被挡,调试模式就收不到代码更新——正是调试要做的事。
+    wifi_hold 只豁免 always_cycle 末尾的硬关 Wi-Fi,从不承诺"不换代码"。
+    allow_restart=False 时只做到"校验通过、已验证可替换"即返回 True
+    (供测试),不替换、不重启。
     重启前删 pidfile,否则新进程启动时 main() 的 pid 检查会以为旧守护还在
     跑而直接退出。on_before_restart 在替换成功、exec 重启之前调用一次:
     update_code 靠它在重启前把执行结果写进 last_command.json,否则 exec
@@ -3071,9 +3118,12 @@ def _check_self_update(allow_restart=True, on_before_restart=None):
     """
     global _LAST_UPDATE_ERROR
     _LAST_UPDATE_ERROR = None
-    if os.path.exists(WIFI_HOLD_FLAG):
+    if os.path.exists(WIFI_HOLD_FLAG) and not explicit:
         _LAST_UPDATE_ERROR = "wifi_hold"
         return False
+    if os.path.exists(WIFI_HOLD_FLAG):
+        # 显式更新:照常进行,只记一笔日志(见本函数 docstring 的说明)。
+        log("self-update: proceeding despite wifi_hold (explicit update_code)")
     manifest = _http_json(SELF_UPDATE_MANIFEST_URL, timeout=15)
     if not isinstance(manifest, dict):
         _LAST_UPDATE_ERROR = "manifest fetch failed"
