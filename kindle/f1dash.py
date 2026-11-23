@@ -1670,9 +1670,16 @@ def _draw_morning(d, data, font, text, cjk, ctext):
     else:
         ctext(28, 92, "天气暂无数据", 16, bold=True)
     if tomorrow:
-        ctext(28, 230, "明日 %d月%d日 %d°–%d° %s"
-              % (int(tomorrow["date"][5:7]), int(tomorrow["date"][8:10]),
-                 tomorrow["low"], tomorrow["high"], _wx_cn(tomorrow)), 15)
+        # 旧缓存(7 天预报之前)的 tomorrow 没有 date 字段:缺了只不显示日期
+        tdate = tomorrow.get("date")
+        if tdate:
+            label = "明日 %d月%d日 %d°–%d° %s" % (
+                int(tdate[5:7]), int(tdate[8:10]),
+                tomorrow["low"], tomorrow["high"], _wx_cn(tomorrow))
+        else:
+            label = "明日 %d°–%d° %s" % (
+                tomorrow["low"], tomorrow["high"], _wx_cn(tomorrow))
+        ctext(28, 230, label, 15)
     _black_bar(d, ctext, cjk, 286, _commute_line(today))
 
     # 头条 344–641:5 条 Muse 生成,过期/缺失只显示无数据
@@ -1736,9 +1743,15 @@ def _draw_evening(d, data, font, text, cjk, ctext):
     else:
         ctext(28, 92, "明日天气暂无数据", 16, bold=True)
     if day_after:
-        ctext(28, 200, "后天 %d月%d日 %d°–%d° %s，更冷注意保暖"
-              % (int(day_after["date"][5:7]), int(day_after["date"][8:10]),
-                 day_after["low"], day_after["high"], _wx_cn(day_after)), 15)
+        adate = day_after.get("date")
+        if adate:
+            label = "后天 %d月%d日 %d°–%d° %s，更冷注意保暖" % (
+                int(adate[5:7]), int(adate[8:10]),
+                day_after["low"], day_after["high"], _wx_cn(day_after))
+        else:
+            label = "后天 %d°–%d° %s，更冷注意保暖" % (
+                day_after["low"], day_after["high"], _wx_cn(day_after))
+        ctext(28, 200, label, 15)
     _black_bar(d, ctext, cjk, 270,
                "明早" + _commute_line(tomorrow).replace("早上", "", 1))
 
