@@ -17,6 +17,7 @@ rsync -q kindle/f1icon.json "$HOST:$DIR/f1icon.json"   # 页眉头盔图标(缺�
 rsync -q kindle/f1logo.json "$HOST:$DIR/f1logo.json"   # F1 官方徽标(缺了页眉无标)
 rsync -q cloud/render.py   "$HOST:$DIR/render.py"
 rsync -q cloud/fonts/*.ttf "$HOST:$DIR/fonts/"         # Barlow 出图字体(OFL)
+rsync -q cloud/fonts/*.ttc "$HOST:$DIR/fonts/" 2>/dev/null || true  # Noto Sans CJK SC(若已提交)
 
 echo "==> Python venv + 依赖"
 ssh "$HOST" bash -s <<'REMOTE'
@@ -37,6 +38,20 @@ if [ ! -f fonts/BarlowSemiCondensed-Bold.ttf ]; then
       "https://raw.githubusercontent.com/google/fonts/main/ofl/jost/Jost%5Bwght%5D.ttf"
   fi
 fi
+
+# 中文字体:Noto Sans CJK SC(床头屏中文标题/头条用,Barlow 没有 CJK 字形)。
+# 两个 TTC 各约 20MB,只下一次;渲染代码取其中 index=2 的 SC 面。
+# 仓库不提交 40MB 二进制,Oracle 上按需下载;下不到则中文缺字,渲染不崩溃。
+for w in Regular Bold; do
+  f="fonts/NotoSansCJK-${w}.ttc"
+  if [ ! -f "$f" ]; then
+    echo "==> 下载 Noto Sans CJK SC ${w}"
+    curl -fsSL -o "$f" \
+      "https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTC/NotoSansCJK-${w}.ttc" \
+      || echo "WARN: CJK 字体下载失败,中文将缺字(稍后重跑 deploy.sh)"
+  fi
+done
+ls -la fonts/ | grep -i -E "noto|cjk" || echo "WARN: 无 CJK 字体文件"
 REMOTE
 
 echo "==> systemd service + timer(每 10 分钟渲染一次)"

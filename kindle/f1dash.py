@@ -593,6 +593,26 @@ BARCA_TEAM_ID = 83      # ESPN soccer 里的 FC Barcelona
 BARCA_LEAGUE = "esp.1"  # LaLiga
 TRENDING_URL = "https://github.com/trending"
 
+# WMO 天气码 → 中文短语(床头屏用;仪表盘沿用英文 WMO_TEXT)
+WMO_CN = {0: "晴", 1: "多云", 2: "多云", 3: "阴",
+          45: "雾", 48: "雾",
+          51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨",
+          56: "冻毛毛雨", 57: "冻毛毛雨",
+          61: "小雨", 63: "雨", 65: "大雨",
+          66: "冻雨", 67: "冻雨",
+          71: "小雪", 73: "雪", 75: "大雪", 77: "雪",
+          80: "阵雨", 81: "阵雨", 82: "大阵雨",
+          85: "阵雪", 86: "阵雪",
+          95: "雷阵雨", 96: "雷阵雨", 99: "雷阵雨"}
+
+
+def _wx_cn(day):
+    """一天预报的中文天气词(优先 WMO 码查表,缺码用英文原文兜底)。"""
+    if not day:
+        return "—"
+    return WMO_CN.get(day.get("code"), day.get("text") or "—")
+
+
 # WMO 天气码 → 短语(open-meteo daily.weather_code)
 WMO_TEXT = {0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy",
             45: "Fog", 48: "Fog",
@@ -606,25 +626,68 @@ WMO_TEXT = {0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Cloudy",
             95: "Thunderstorm", 96: "Storms", 99: "Storms"}
 
 
+_WEEKDAY_CN = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+
+def _hhmm(iso):
+    """'2026-11-23T06:30' → '06:30';解析失败返回 None。"""
+    try:
+        return str(iso)[11:16]
+    except Exception:
+        return None
+
+
 def get_weather():
-    """Hangzhou 每日预报(当日高低温/天气/降水概率 + 明日概要),Open-Meteo。
+    """Hangzhou 每日预报(当日高低温/天气/降水概率 + 明日概要 + 未来 7 天),Open-Meteo。
 
     只取 daily 日值,不取 current——屏保一挂一整天,当前气温几分钟后就失真。
+    forecast_days=7:晨报要明日预告、晚报要后天预告、周末屏要周六/周日/
+    下周一三天,2 天不够。旧缓存(2 天、无 days/humidity 字段)仍能读:
+    days 按实际天数生成,缺失字段用 None 兜底,渲染时跳过。
     """
     q = WEATHER_CITY
     url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
            "&daily=temperature_2m_max,temperature_2m_min,weather_code,"
-           "precipitation_probability_max&timezone=%s&forecast_days=2"
+           "precipitation_probability_max,precipitation_probability_min,"
+           "relative_humidity_2m_max,"
+           "sunrise,sunset&timezone=%s&forecast_days=7"
            % (q["lat"], q["lon"], urllib.parse.quote(q["tz"])))
     daily = fetch_json(url)["daily"]
 
     def day(i):
-        return {"high": round(daily["temperature_2m_max"][i]),
-                "low": round(daily["temperature_2m_min"][i]),
-                "text": WMO_TEXT.get(int(daily["weather_code"][i]), "—"),
-                "pop": int(daily["precipitation_probability_max"][i] or 0)}
+        try:
+            d = {"high": round(daily["temperature_2m_max"][i]),
+                 "low": round(daily["temperature_2m_min"][i]),
+                 "text": WMO_TEXT.get(int(daily["weather_code"][i]), "—"),
+                 "pop": int(daily["precipitation_probability_max"][i] or 0),
+                 "code": int(daily["weather_code"][i])}
+        except Exception:
+            return None
+        try:
+            d["pop_min"] = int(daily["precipitation_probability_min"][i] or 0)
+        except Exception:
+            d["pop_min"] = None
+        try:
+            d["date"] = str(daily["time"][i])
+            d["weekday"] = time.strptime(d["date"], "%Y-%m-%d").tm_wday
+        except Exception:
+            d["date"], d["weekday"] = None, None
+        try:
+            d["humidity"] = int(daily["relative_humidity_2m_max"][i])
+        except Exception:
+            d["humidity"] = None
+        try:
+            d["sunrise"] = _hhmm(daily["sunrise"][i])
+            d["sunset"] = _hhmm(daily["sunset"][i])
+        except Exception:
+            d["sunrise"], d["sunset"] = None, None
+        return d
 
-    return {"city": q["name"], "today": day(0), "tomorrow": day(1)}
+    days = [d for d in (day(i) for i in range(7)) if d is not None]
+    out = {"city": q["name"], "days": days}
+    out["today"] = days[0] if days else None
+    out["tomorrow"] = days[1] if len(days) > 1 else None
+    return out
 
 
 def _laliga_season():
@@ -805,6 +868,104 @@ def get_dashboard_data():
             out[key] = val
         if entry is not None:
             _mark_stale(out, key, entry)
+    return out
+
+
+# ---------------- 床头屏(晨报 / 晚报 / 周末,设计稿 v2 无日程) ----------------
+# 新闻纯 Muse 生成,不做 RSS 兜底:云端只读 headlines.json(Muse 每天
+# 06:30/18:00 生成并 scp 到 /opt/f1dash/out/)。缺失/过期时新闻块只显示
+# 无数据,其余块正常出图。收盘/模拟盘/本周回顾等钱数绝不写死在代码里,
+# 只读 Muse 提供的 briefing.json(没有就留 TODO 占位,见 read_briefing)。
+
+def _read_json_file(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_headlines(path):
+    """读 headlines.json,返回 {"morning": [...], "evening": [...],
+    "fresh_morning": bool, "fresh_evening": bool, "updated": str}。
+
+    格式 {"updated": "2026-11-23T06:30:00+08:00", "date": "2026-11-23",
+    "morning": [5 条], "evening": [4 条]};每条 ≤20 字、无 emoji。
+    新鲜度按 updated 的年龄算:晨报 >6h、晚报 >12h 即过期;文件缺失、
+    损坏、updated 解析失败一律按过期处理(新闻块显示无数据)。
+    """
+    out = {"morning": [], "evening": [], "fresh_morning": False,
+           "fresh_evening": False, "updated": None}
+    raw = _read_json_file(path) if path else {}
+    if not raw:
+        return out
+    out["updated"] = raw.get("updated")
+    for key in ("morning", "evening"):
+        val = raw.get(key)
+        if isinstance(val, list):
+            out[key] = [str(s)[:40] for s in val if s]
+    try:
+        upd = time.strptime(str(raw["updated"])[:19], "%Y-%m-%dT%H:%M:%S")
+        age = time.time() - (calendar.timegm(upd) - 8 * 3600)
+    except Exception:
+        return out
+    if 0 <= age <= 6 * 3600 and out["morning"]:
+        out["fresh_morning"] = True
+    if 0 <= age <= 12 * 3600 and out["evening"]:
+        out["fresh_evening"] = True
+    return out
+
+
+def read_briefing(path):
+    """读 Muse 提供的 briefing.json(可选补充数据),没有/损坏返回 {}。
+
+    字段全是可选的,缺哪个渲染时就留 TODO 占位,绝不把钱数写死在代码里:
+    {"polymarket": {"cash": "$1,022.51", "pnl": "+$172.51"},
+     "weekly": {"total": 569990.49, "pnl": -18705.94, "pct": -3.23,
+                "date": "2026-11-21", "note": "中证500周跌7.11%"},
+     "close": {"510500": {"price": 6.053, "chg": -3.71, "date": "11-20"},
+               "grid_note": "中证500草稿待定·周一开盘确认"},
+     "tonight": "F1 Verstappen夺冠已结算 · 巴萨21:00开球"}
+    """
+    return _read_json_file(path) if path else {}
+
+
+def _beijing_now(now=None):
+    """北京时间 struct_time;now 为 epoch 秒(测试用),缺省取当前时间。"""
+    return time.gmtime((time.time() if now is None else now) + 8 * 3600)
+
+
+def select_briefing_template(now=None):
+    """按北京时间 + 星期几选模板(设计稿 §1)。
+
+    工作日 06:35–09:00 晨报;工作日 18:00–23:00 晚报;周五 18:00 起及
+    周末 07:00–23:00 周末屏;其余时段(白天工作日不在家、深夜)保留原
+    仪表盘/海报,不刷床头屏。
+    """
+    t = _beijing_now(now)
+    wd, hhmm = t.tm_wday, t.tm_hour * 60 + t.tm_min
+    if wd >= 5:  # 周六/周日
+        return "weekend" if 7 * 60 <= hhmm < 23 * 60 else "dashboard"
+    if wd == 4 and hhmm >= 18 * 60:  # 周五 18:00 起
+        return "weekend"
+    if 6 * 60 + 35 <= hhmm < 9 * 60:
+        return "morning"
+    if 18 * 60 <= hhmm < 23 * 60:
+        return "evening"
+    return "dashboard"
+
+
+def get_briefing_data(headlines_path=None, briefing_path=None, now=None):
+    """床头屏数据:get_dashboard_data() + 头条 + 补充数据 + 模板选择。
+
+    err 不为 None 时 render.py 沿用旧逻辑(保留上一张图,exit 1)。
+    """
+    out = get_dashboard_data()
+    out["template"] = select_briefing_template(now)
+    out["headlines"] = read_headlines(headlines_path)
+    out["briefing"] = read_briefing(briefing_path)
+    out["now_bj"] = _beijing_now(now)
     return out
 
 
@@ -1250,13 +1411,49 @@ def _draw_poster_results(d, data, font, text, nr):
     _poster_footer(d, data, font, text, nr)
 
 
-def png_render(data, out=SS_OUT):
-    # 主数据源(current.json)拉取失败时不覆盖屏保图,保留上一张成功的画面;
-    # 仅当显式 --out 指向调试路径时才允许把失败态渲染出来。
-    if data["err"] is not None and out == SS_OUT:
-        print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
-        return False
+def _cjk_candidates(bold):
+    """中文字体候选:Noto Sans CJK SC(简体中文面,TTC 里 index=2)。
 
+    仓库 Barlow/Futura/Jost 都没有 CJK 字形,中文标题/头条必须走这套。
+    Oracle 上由 deploy.sh 从 notofonts/noto-cjk 下载到 /opt/f1dash/fonts/;
+    开发机用系统字体;都没有时 cjk() 返回 None,ctext 退回 Barlow(中文
+    会缺字,测试会显式断言 CJK 可用)。
+    """
+    name = "NotoSansCJK-Bold.ttc" if bold else "NotoSansCJK-Regular.ttc"
+    return [os.path.join(_FONT_DIR, name),
+            os.path.join(_CLOUD_FONT_DIR, name),
+            os.path.join("/opt/f1dash/fonts", name),
+            "/usr/share/fonts/opentype/noto/" + name]
+
+
+def _fit_cjk(d, cjk, s, max_w, start, bold=True, min_size=12):
+    """中文动态缩字直到宽度 <= max_w(设计区坐标);无 CJK 字体时返回 start。"""
+    if cjk(bold, start) is None:
+        return start
+    size = start
+    while size > min_size and d.textlength(s, font=cjk(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+        size -= 1
+    return size
+
+
+def _cjk_ellipsize(d, cjk, s, max_w, size, bold=True):
+    """中文按设计区宽度截断(越界加 '…');无 CJK 字体时原样返回。"""
+    if cjk(bold, size) is None:
+        return s
+    if d.textlength(s, font=cjk(bold, size)) / (FULL_SCALE * AA_SCALE) <= max_w:
+        return s
+    while s and d.textlength(s + "…", font=cjk(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+        s = s[:-1]
+    return s + "…"
+
+
+def _new_canvas():
+    """超采样画布 + 字体闭包(font/text 沿用旧逻辑,新增 cjk/ctext 画中文)。
+
+    返回 (img, d, font, text, cjk, ctext)。ctext 用 Noto Sans CJK SC
+    画整串(含串里的拉丁/数字/°C,中文字体自带这些字形);无 CJK 字体时
+    退回 Barlow(中文缺字,仅作兜底不崩溃)。
+    """
     img = Image.new("L", (SS_SIZE[0] * AA_SCALE, SS_SIZE[1] * AA_SCALE), 255)
     d = ImageDraw.Draw(img)
 
@@ -1277,16 +1474,31 @@ def png_render(data, out=SS_OUT):
             return f
         return ImageFont.load_default()
 
+    def cjk(bold, size):
+        for path in _cjk_candidates(bold):
+            try:
+                # TTC 里简体中文面 index=2(JP 0 / KR 1 / SC 2 / TC 3 / HK 4)
+                return ImageFont.truetype(path, max(1, round(size * FULL_SCALE * AA_SCALE)),
+                                         index=2)
+            except Exception:
+                continue
+        return None
+
     def text(x, y, s, f, fill=0, anchor="la", **kw):
         # kw 透传 Pillow 原生参数(如 stroke_width/stroke_fill 描边字)
         d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor=anchor, **kw)
 
-    # 赛事周末(距下一场开赛 <3 天)切海报,否则默认仪表盘
-    if race_poster_active(data):
-        _draw_poster(d, data, font, text)
-    else:
-        _draw_dashboard(d, data, font, text)
+    def ctext(x, y, s, size, bold=False, fill=0, anchor="la"):
+        f = cjk(bold, size)
+        if f is None:
+            f = font(bold, size)
+        d.text((fs(x), fy(y)), s, font=f, fill=fill, anchor=anchor)
 
+    return img, d, font, text, cjk, ctext
+
+
+def _finish_canvas(img, out):
+    """超采样缩回 + 两端钳位 + 落盘(与旧 png_render 完全一致的输出处理)。"""
     img = img.resize(SS_SIZE, Image.LANCZOS)
     # 两端钳位:硬阈值(全拍纯黑白)把 AA 边缘像素也拍成锯齿,实测字体锯齿过重;
     # 改为笔画芯(<64)拍纯黑防发虚、背景(>160)拍纯白,64-160 的 1px AA 过渡带
@@ -1296,6 +1508,415 @@ def png_render(data, out=SS_OUT):
     img.save(out)
     print("saved:", out, img.size, img.mode)
     return True
+
+
+def png_render(data, out=SS_OUT):
+    # 主数据源(current.json)拉取失败时不覆盖屏保图,保留上一张成功的画面;
+    # 仅当显式 --out 指向调试路径时才允许把失败态渲染出来。
+    if data["err"] is not None and out == SS_OUT:
+        print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
+        return False
+
+    img, d, font, text, _cjk, _ctext = _new_canvas()
+
+    # 赛事周末(距下一场开赛 <3 天)切海报,否则默认仪表盘
+    if race_poster_active(data):
+        _draw_poster(d, data, font, text)
+    else:
+        _draw_dashboard(d, data, font, text)
+
+    return _finish_canvas(img, out)
+
+
+# ---------------- 床头屏渲染(晨报 / 晚报 / 周末,设计稿 v2 无日程) ----------------
+# 全部在 600x800 设计区画,fs/fy 与旧版式同一套坐标;状态栏右侧留空,
+# Kindle 端 overlay_battery 会在那里叠加电量角标(云端不知道电量)。
+
+def _bj_date_cn(now_bj):
+    """北京时间 struct_time → '11月23日 星期一'。"""
+    return "%d月%d日 %s" % (now_bj.tm_mon, now_bj.tm_mday,
+                          _WEEKDAY_CN[now_bj.tm_wday])
+
+
+def _clothing_tip(day):
+    """穿衣提示(规则来自气温/降雨概率,纯中文):"""
+    if not day:
+        return None
+    tips = []
+    if day["low"] <= 10:
+        tips.append("早晚凉，午间暖，出门加外套")
+    elif day["high"] - day["low"] >= 10:
+        tips.append("昼夜温差大，注意添衣")
+    if day["pop"] >= 50:
+        tips.append("降雨概率高，记得带伞")
+    return "；".join(tips) if tips else "气温适宜"
+
+
+def _commute_line(day):
+    """通勤黑条文案:早上看白天降雨概率(pop_min),晚上看全天最高(pop)。
+
+    日最高概率常是夜里那阵雨,用它决定早上会误判成开车(设计稿示例:
+    白天 20% 骑车去、夜间 80% 返程有雨)。
+    """
+    if not day:
+        return "早上骑 Ninebot 去 · 晚上返程"
+    day_pop = day.get("pop_min") if day.get("pop_min") is not None else day["pop"]
+    morning = "早上骑 Ninebot 去" if day_pop < 50 else "早上开车去"
+    evening = "晚上返程有雨" if day["pop"] >= 50 else "晚上返程无雨"
+    return "%s · %s" % (morning, evening)
+
+
+def _weather_day(data, date_str):
+    """按 'YYYY-MM-DD' 在 weather.days 里找一天;找不到返回 None。"""
+    for dd in ((data.get("weather") or {}).get("days") or []):
+        if dd.get("date") == date_str:
+            return dd
+    return None
+
+
+def _brief_header(d, font, text, ctext, cjk, now_bj, title_en, upd_hhmm):
+    """床头屏页眉:左中文日期、右英文标题、第二行城市 + 更新时间,下划线。"""
+    ctext(28, 22, _bj_date_cn(now_bj), 20, bold=True)
+    text(572, 24, title_en, font(True, 15), anchor="ra")
+    text(28, 52, "HANGZHOU", font(False, 11))
+    ctext(572, 52, "更新 %s" % upd_hhmm, 11, anchor="ra")
+    d.line([fs(28), fy(78), fs(572), fy(78)], fill=0, width=lw(2))
+
+
+def _status_bar(d, font, text, label):
+    """状态栏:分隔线 + 左侧小字(模板名·更新时间);右侧留空给电量角标。"""
+    d.line([fs(28), fy(758), fs(572), fy(758)], fill=0, width=lw(2))
+    text(28, 766, label, font(False, 11))
+
+
+def _black_bar(d, ctext, cjk, y, s, h=44):
+    """通勤黑条(反色):黑底白字,中文按宽缩字,居中。"""
+    d.rectangle([fs(28), fy(y), fs(572) - 1, fy(y + h) - 1], fill=0)
+    size = _fit_cjk(d, cjk, s, 544 - 24, 16)
+    ctext(300, y + h / 2, s, size, bold=True, fill=255, anchor="mm")
+
+
+def _brief_box(d, font, ctext, cjk, x0, x1, title, lines, y0, y1):
+    """床头屏小盒:中文标题居中 + 下划线 + '- ' 行列(限 3 行,超长截断)。"""
+    cx = (x0 + x1) / 2
+    d.rectangle([fs(x0), fy(y0), fs(x1) - 1, fy(y1) - 1], outline=0, width=lw(2))
+    ctext(cx, y0 + 10, title, 14, bold=True, anchor="ma")
+    d.line([fs(x0 + 14), fy(y0 + 28), fs(x1 - 14), fy(y0 + 28)], fill=0, width=lw(2))
+    ly = y0 + 42
+    for s in (lines or ["—"])[:3]:
+        line = _cjk_ellipsize(d, cjk, "- %s" % s, x1 - x0 - 24, 12, bold=True)
+        ctext(x0 + 12, ly, line, 12, bold=True)
+        ly += 22
+
+
+def _headline_rows(d, font, text, ctext, cjk, items, y0, step, size=17):
+    """头条行列:序号(Barlow 加粗)+ 中文一行,超宽截断;返回末行 y。"""
+    y = y0
+    for i, s in enumerate(items):
+        text(28, y, "%d." % (i + 1), font(True, size))
+        line = _cjk_ellipsize(d, cjk, s, 544 - 30, size, bold=True)
+        ctext(58, y, line, size, bold=True)
+        y += step
+    return y
+
+
+def _section_title(d, font, text, ctext, y, title_cn, title_en):
+    """区块标题:中文 18 加粗 + 英文 13,下划线在 y+28。"""
+    ctext(28, y, title_cn, 18, bold=True)
+    text(28 + 4 + len(title_cn) * 20, y + 4, title_en, font(False, 13))
+    d.line([fs(28), fy(y + 28), fs(572), fy(y + 28)], fill=0, width=lw(2))
+
+
+def _weather_lines(day):
+    """一天预报的中文行列(湿度/日出日落缺失时跳过该段)。"""
+    if not day:
+        return []
+    lines = []
+    pop = day["pop"]
+    if day.get("pop_min") is not None and day["pop_min"] != pop:
+        lines.append("降雨概率 %d%%–%d%%" % (day["pop_min"], pop))
+    else:
+        lines.append("降雨概率 %d%%" % pop)
+    sun = []
+    if day.get("sunrise"):
+        sun.append("日出 %s" % day["sunrise"])
+    if day.get("sunset"):
+        sun.append("日落 %s" % day["sunset"])
+    hum = ("湿度 %d%%" % day["humidity"]) if day.get("humidity") is not None else None
+    tail = " · ".join([x for x in ([hum] if hum else []) + sun if x])
+    if tail:
+        lines.append(tail)
+    return lines
+
+
+def _draw_morning(d, data, font, text, cjk, ctext):
+    """晨报屏 v2(设计稿 §2):页眉 70 / 天气 266 / 头条 297 / 底部三联 117 / 状态栏 34。"""
+    now_bj = data.get("now_bj") or _beijing_now()
+    upd = data.get("upd", "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min))
+    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
+    _brief_header(d, font, text, ctext, cjk, now_bj, "MORNING BRIEFING", upd)
+
+    # 天气 78–344:大字温差 + 天气词 + 降雨/湿度/日出日落 + 穿衣提示 + 明日预告 + 通勤黑条
+    w = data.get("weather") or {}
+    today, tomorrow = w.get("today"), w.get("tomorrow")
+    if today:
+        text(28, 92, "%d°–%d°" % (today["low"], today["high"]), font(True, 46))
+        ctext(210, 98, _wx_cn(today), 20, bold=True)
+        for i, line in enumerate(_weather_lines(today)):
+            ctext(210, 130 + i * 26, line, 15)
+        tip = _clothing_tip(today)
+        if tip:
+            ctext(28, 200, tip, 15, bold=True)
+    else:
+        ctext(28, 92, "天气暂无数据", 16, bold=True)
+    if tomorrow:
+        ctext(28, 230, "明日 %d月%d日 %d°–%d° %s"
+              % (int(tomorrow["date"][5:7]), int(tomorrow["date"][8:10]),
+                 tomorrow["low"], tomorrow["high"], _wx_cn(tomorrow)), 15)
+    _black_bar(d, ctext, cjk, 286, _commute_line(today))
+
+    # 头条 344–641:5 条 Muse 生成,过期/缺失只显示无数据
+    _section_title(d, font, text, ctext, 360, "头条", "HEADLINES")
+    hl = data.get("headlines") or {}
+    items = hl.get("morning") if hl.get("fresh_morning") else []
+    if items:
+        _headline_rows(d, font, text, ctext, cjk, items[:5], 404, 48)
+    else:
+        ctext(28, 404, "头条暂无更新", 16, bold=True)
+        text(28, 440, "HEADLINES NOT UPDATED YET", font(False, 12))
+
+    # 底部三联 641–758:F1 下一场 / 巴萨 / 模拟盘(钱数只读 briefing.json)
+    br = data.get("briefing") or {}
+    nr = data.get("next_race")
+    f1_lines = []
+    if nr is not None:
+        f1_lines.append(nr["raceName"])
+        f1_lines.append("%s %s" % (short_date(nr["date"]),
+                                   format_race_daytime(nr) or "TBD"))
+    b = data.get("barca") or {}
+    barca_lines = []
+    if b.get("opponent"):
+        barca_lines.append("%s %s" % (b["venue"] or "vs", b["opponent"]))
+    if b.get("when"):
+        barca_lines.append(b["when"])
+    if b.get("rank"):
+        barca_lines.append("LaLiga %s · %d 分" % (b["rank"], b["points"]))
+    pm = br.get("polymarket") or {}
+    pm_lines = []
+    if pm.get("cash"):
+        pm_lines.append("现金 %s" % pm["cash"])
+    if pm.get("pnl"):
+        pm_lines.append("本周 %s" % pm["pnl"])
+    if not pm_lines:
+        pm_lines = ["模拟盘数据待接入"]
+    _brief_box(d, font, ctext, cjk, 28, 206, "F1 下一场", f1_lines, 648, 752)
+    _brief_box(d, font, ctext, cjk, 218, 392, "巴萨", barca_lines, 648, 752)
+    _brief_box(d, font, ctext, cjk, 404, 572, "模拟盘", pm_lines, 648, 752)
+
+    _status_bar(d, font, text, "MORNING BRIEFING · %s" % upd)
+
+
+def _draw_evening(d, data, font, text, cjk, ctext):
+    """晚报屏 v2(设计稿 §3):页眉 70 / 明日天气 250 / 今日收盘 188 / 头条回顾 219 / 今晚一行 39 / 状态栏 34。"""
+    now_bj = data.get("now_bj") or _beijing_now()
+    upd = data.get("upd", "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min))
+    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
+    _brief_header(d, font, text, ctext, cjk, now_bj, "EVENING BRIEFING", upd)
+
+    # 明日天气 78–328:明日大字 + 降雨/湿度/日出日落 + 后天预告 + 明早通勤黑条
+    w = data.get("weather") or {}
+    tomorrow = w.get("tomorrow")
+    days = w.get("days") or []
+    day_after = days[2] if len(days) > 2 else None
+    if tomorrow:
+        text(28, 92, "%d°–%d°" % (tomorrow["low"], tomorrow["high"]), font(True, 46))
+        ctext(210, 98, _wx_cn(tomorrow), 20, bold=True)
+        for i, line in enumerate(_weather_lines(tomorrow)):
+            ctext(210, 130 + i * 26, line, 15)
+    else:
+        ctext(28, 92, "明日天气暂无数据", 16, bold=True)
+    if day_after:
+        ctext(28, 200, "后天 %d月%d日 %d°–%d° %s，更冷注意保暖"
+              % (int(day_after["date"][5:7]), int(day_after["date"][8:10]),
+                 day_after["low"], day_after["high"], _wx_cn(day_after)), 15)
+    _black_bar(d, ctext, cjk, 270,
+               "明早" + _commute_line(tomorrow).replace("早上", "", 1))
+
+    # 今日收盘 328–516:只读 briefing.json,缺了留 TODO 占位,不写死钱数
+    _section_title(d, font, text, ctext, 344, "今日收盘", "MARKET CLOSE")
+    br = data.get("briefing") or {}
+    close = br.get("close") or {}
+    lines = []
+    c5105 = close.get("510500") or {}
+    if c5105.get("price") is not None:
+        lines.append("中证500ETF %s %+.2f%%（%s收）"
+                     % (c5105["price"], c5105.get("chg", 0),
+                        c5105.get("date", "")))
+    if close.get("grid_note"):
+        lines.append(close["grid_note"])
+    pm = br.get("polymarket") or {}
+    if pm.get("pnl") and pm.get("cash"):
+        lines.append("模拟盘 %s · 现金 %s" % (pm["pnl"], pm["cash"]))
+    b = data.get("barca") or {}
+    if b.get("opponent") and b.get("when"):
+        lines.append("巴萨今晚 %s %s" % (b["when"], b["opponent"]))
+    if not lines:
+        lines = ["收盘数据待接入", "CLOSE DATA NOT AVAILABLE"]
+    y = 388
+    for s in lines[:4]:
+        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
+        y += 30
+
+    # 头条回顾 516–735:晚报 4 条;没有就用晨报前 4 条;都没有显示无数据
+    _section_title(d, font, text, ctext, 532, "头条回顾", "RECAP")
+    hl = data.get("headlines") or {}
+    if hl.get("fresh_evening"):
+        items = hl.get("evening") or []
+    elif hl.get("fresh_morning"):
+        items = (hl.get("morning") or [])[:4]
+    else:
+        items = []
+    if items:
+        _headline_rows(d, font, text, ctext, cjk, items[:4], 576, 38, size=16)
+    else:
+        ctext(28, 576, "头条回顾暂无更新", 16, bold=True)
+
+    # 今晚一行 735–758
+    tonight = br.get("tonight")
+    if not tonight:
+        nr = data.get("next_race")
+        tonight = "今晚 F1 %s · 巴萨 %s %s" % (
+            nr["raceName"] if nr else "—",
+            b.get("when", ""), b.get("opponent", "")) if nr or b.get("opponent") else None
+    if tonight:
+        ctext(28, 730, _cjk_ellipsize(d, cjk, tonight, 544, 14, bold=True),
+              14, bold=True)
+
+    _status_bar(d, font, text, "EVENING BRIEFING · %s" % upd)
+
+
+def _draw_weekend(d, data, font, text, cjk, ctext):
+    """周末屏 v2(设计稿 §4):页眉 70 / 两天天气 210 / 本周回顾 170 / 周末比赛 150 / 下周一预告 150 / 状态栏 34。"""
+    now_bj = data.get("now_bj") or _beijing_now()
+    upd = data.get("upd", "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min))
+    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
+    _brief_header(d, font, text, ctext, cjk, now_bj, "WEEKEND", upd)
+
+    # 本周六/周日:周五 18:00 看即将到的周六日;周六看今天/明天;周日看昨天/今天
+    base = calendar.timegm(now_bj) - 8 * 3600
+    wd = now_bj.tm_wday
+    sat_off = {4: 1, 5: 0, 6: -1}.get(wd, 1)
+    sat = time.gmtime(base + sat_off * 86400)
+    sun = time.gmtime(base + (sat_off + 1) * 86400)
+    mon = time.gmtime(base + (sat_off + 2) * 86400)
+
+    def _day_box(x0, x1, day_gmt, label_cn):
+        date_str = time.strftime("%Y-%m-%d", day_gmt)
+        day = _weather_day(data, date_str)
+        d.rectangle([fs(x0), fy(92), fs(x1) - 1, fy(278) - 1], outline=0, width=lw(2))
+        ctext((x0 + x1) / 2, 102, "%s %d月%d日" % (label_cn, day_gmt.tm_mon, day_gmt.tm_mday),
+              16, bold=True, anchor="ma")
+        if not day:
+            ctext((x0 + x1) / 2, 150, "天气暂无数据", 14, anchor="ma")
+            return
+        text((x0 + x1) / 2, 132, "%d°–%d°" % (day["low"], day["high"]),
+             font(True, 30), anchor="ma")
+        ctext((x0 + x1) / 2, 172, _wx_cn(day), 15, bold=True, anchor="ma")
+        ctext((x0 + x1) / 2, 198, "降雨 %d%%" % day["pop"], 13, anchor="ma")
+        sun_line = " · ".join([x for x in (
+            ("日出 %s" % day["sunrise"]) if day.get("sunrise") else None,
+            ("日落 %s" % day["sunset"]) if day.get("sunset") else None) if x])
+        if sun_line:
+            ctext((x0 + x1) / 2, 220, sun_line, 13, anchor="ma")
+        if day["pop"] <= 20 and day.get("code") in (0, 1, 2, 3):
+            ctext((x0 + x1) / 2, 244, "适合外出", 13, bold=True, anchor="ma")
+
+    _day_box(28, 292, sat, "周六")
+    _day_box(308, 572, sun, "周日")
+
+    # 本周回顾 288–458:只读 briefing.json 的 weekly,缺了留 TODO 占位
+    _section_title(d, font, text, ctext, 304, "本周回顾", "WEEKLY REVIEW")
+    br = data.get("briefing") or {}
+    wk = br.get("weekly") or {}
+    lines = []
+    if wk.get("total") is not None and wk.get("pnl") is not None:
+        lines.append("总资产 ¥%s · 本期 %s%.2f"
+                     % ("{:,.2f}".format(wk["total"]),
+                        "+" if wk["pnl"] >= 0 else "", wk["pnl"]))
+    if wk.get("note"):
+        lines.append(wk["note"])
+    pm = br.get("polymarket") or {}
+    if pm.get("pnl"):
+        lines.append("模拟盘本周 %s" % pm["pnl"])
+    if not lines:
+        lines = ["本周回顾待接入", "WEEKLY REVIEW NOT AVAILABLE"]
+    y = 348
+    for s in lines[:3]:
+        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
+        y += 30
+
+    # 周末比赛 458–608:F1 下一场 + 巴萨 + Trending 第一
+    _section_title(d, font, text, ctext, 474, "周末比赛", "MATCHES & RACES")
+    nr = data.get("next_race")
+    b = data.get("barca") or {}
+    t = data.get("trending") or {}
+    mlines = []
+    if nr is not None:
+        mlines.append("F1 下一场 %s %s" % (nr["raceName"], short_date(nr["date"])))
+    if b.get("opponent"):
+        mlines.append("巴萨 %s %s %s" % (b["venue"] or "vs", b["opponent"], b["when"] or ""))
+    if t.get("repo"):
+        mlines.append("Trending #1 %s" % t["repo"])
+    y = 518
+    for s in mlines[:3]:
+        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
+        y += 28
+
+    # 下周一预告 608–758:周一天气 + 通勤 + 开盘确认(briefing 的 grid_note)
+    _section_title(d, font, text, ctext, 624, "下周一预告", "MONDAY PREVIEW")
+    mon_str = time.strftime("%Y-%m-%d", mon)
+    mday = _weather_day(data, mon_str)
+    mlines = []
+    if mday:
+        mlines.append("%d月%d日 %d°–%d° %s" % (mon.tm_mon, mon.tm_mday,
+                                             mday["low"], mday["high"], _wx_cn(mday)))
+    mlines.append("早上骑 Ninebot、送尧尧上学")
+    close = br.get("close") or {}
+    if close.get("grid_note"):
+        mlines.append(close["grid_note"])
+    elif close.get("510500"):
+        c5105 = close["510500"]
+        mlines.append("周一开盘确认中证500：收 %s" % c5105.get("price", ""))
+    y = 668
+    for s in mlines[:3]:
+        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
+        y += 28
+
+    _status_bar(d, font, text, "WEEKEND · %s" % upd)
+
+
+def png_render_briefing(data, out=SS_OUT):
+    """床头屏渲染:按 data["template"] 选晨报/晚报/周末;dashboard 走旧 png_render。
+
+    data["err"] 不为 None 时与旧逻辑一致(只在 --out 调试路径才画)。
+    """
+    if data.get("err") is not None and out == SS_OUT:
+        print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
+        return False
+    template = data.get("template") or "dashboard"
+    img, d, font, text, cjk, ctext = _new_canvas()
+    if template == "morning":
+        _draw_morning(d, data, font, text, cjk, ctext)
+    elif template == "evening":
+        _draw_evening(d, data, font, text, cjk, ctext)
+    elif template == "weekend":
+        _draw_weekend(d, data, font, text, cjk, ctext)
+    else:
+        if race_poster_active(data):
+            _draw_poster(d, data, font, text)
+        else:
+            _draw_dashboard(d, data, font, text)
+    return _finish_canvas(img, out)
 
 
 # ---------------- 守护进程(service) ----------------
@@ -2879,6 +3500,69 @@ def mock_data(err=False, poster=False):
         "err": Exception("network unreachable") if err else None,
         "stale": {},
     }
+
+
+def mock_briefing_data(template="morning"):
+    """床头屏离线假数据:--mock-morning/--mock-evening/--mock-weekend 用。
+
+    天气/头条取设计稿 v2 的示例值(2026-11-23 实报天气 + 当日示例头条),
+    仅供版式验证,不是实时数据;briefing.json 的钱数示例也只在 mock 里出现,
+    生产渲染缺 briefing.json 时留 TODO 占位。
+    """
+    import calendar as _cal
+
+    def _bj_epoch(y, mo, dd, hh, mm):
+        return _cal.timegm((y, mo, dd, hh, mm, 0, 0, 0, 0)) - 8 * 3600
+
+    def _day(date, high, low, text, pop, pop_min=10, hum=64,
+             sunrise="06:30", sunset="16:59"):
+        wd = time.strptime(date, "%Y-%m-%d").tm_wday
+        code = {"Clear": 0, "Mostly clear": 1, "Partly cloudy": 2,
+                "Cloudy": 3}.get(text, 3)
+        return {"date": date, "weekday": wd, "high": high, "low": low,
+                "text": text, "code": code, "pop": pop, "pop_min": pop_min,
+                "humidity": hum, "sunrise": sunrise, "sunset": sunset}
+
+    days = [_day("2026-11-23", 17, 9, "Cloudy", 80, 20, 64, "06:30", "16:59"),
+            _day("2026-11-24", 14, 3, "Partly cloudy", 10, 10, 55, "06:31", "16:58"),
+            _day("2026-11-25", 13, 4, "Partly cloudy", 10, 10, 55, "06:32", "16:58"),
+            _day("2026-11-26", 15, 5, "Clear", 10, 10, 50, "06:33", "16:58"),
+            _day("2026-11-27", 17, 6, "Clear", 10, 10, 50, "06:33", "16:58"),
+            _day("2026-11-28", 20, 4, "Clear", 10, 10, 45, "06:34", "16:58"),
+            _day("2026-11-29", 19, 7, "Clear", 10, 10, 45, "06:35", "16:58"),
+            _day("2026-11-30", 23, 9, "Clear", 10, 10, 45, "06:36", "16:57")]
+    data = mock_data(err=False)
+    if template == "morning":
+        today, tomorrow = days[0], days[1]
+        now_bj = _beijing_now(_bj_epoch(2026, 11, 23, 6, 35))
+    elif template == "evening":
+        today, tomorrow = days[0], days[1]
+        now_bj = _beijing_now(_bj_epoch(2026, 11, 23, 18, 5))
+    else:  # weekend:周六 11-28 当天
+        today, tomorrow = days[5], days[6]
+        now_bj = _beijing_now(_bj_epoch(2026, 11, 28, 9, 0))
+    data["weather"] = {"city": "HANGZHOU", "today": today,
+                       "tomorrow": tomorrow, "days": days}
+    data["template"] = template
+    data["now_bj"] = now_bj
+    data["upd"] = "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min)
+    data["upd_stamp"] = "%02d-%02d %s" % (now_bj.tm_mon, now_bj.tm_mday, data["upd"])
+    data["headlines"] = {
+        "morning": ["美股科技股周五暴跌纳指跌5.3%", "英伟达跌14% AMD跌13%",
+                    "Anthropic称完成黎曼猜想证明", "中证500周五跌3.71%创52周新低",
+                    "F1拉斯维加斯 Verstappen夺冠"],
+        "evening": ["美股科技股周五暴跌纳指跌5.3%", "英伟达跌14% AMD跌13%",
+                    "Anthropic称完成黎曼猜想证明", "中证500周五跌3.71%创52周新低"],
+        "fresh_morning": True, "fresh_evening": True,
+        "updated": "2026-11-23T06:30:00+08:00"}
+    data["briefing"] = {
+        "polymarket": {"cash": "$1,022.51", "pnl": "+$172.51"},
+        "weekly": {"total": 569990.49, "pnl": -18705.94, "pct": -3.23,
+                   "date": "2026-11-21", "note": "中证500周跌7.11% · 收6.053"},
+        "close": {"510500": {"price": 6.053, "chg": -3.71, "date": "11-20"},
+                  "grid_note": "中证500草稿待定 · 周一开盘确认"},
+        "tonight": "F1 Verstappen夺冠已结算 · 巴萨21:00开球"}
+    return data
 
 
 def main():
