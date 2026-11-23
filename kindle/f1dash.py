@@ -2819,11 +2819,15 @@ def _sanitize_log_line(line):
 
 
 def _read_log_tail(path, n, max_bytes=100 * 1024):
-    """读日志尾 n 行(脱敏后);文件缺失/超大/异常返回 []。"""
+    """读日志尾 n 行(脱敏后);文件缺失/异常返回 []。超大文件只读末尾
+    max_bytes(丢弃首个不完整行),而不是返回空——service.log 跑久了超
+    100KB 是常态,之前直接返回 [] 导致远程取日志拿到空列表。"""
     try:
-        if os.path.getsize(path) > max_bytes:
-            return []
+        size = os.path.getsize(path)
         with open(path, "r", errors="replace") as f:
+            if size > max_bytes:
+                f.seek(max(0, size - max_bytes))
+                f.readline()  # 丢弃可能不完整的首行
             lines = f.readlines()[-n:]
         return [_sanitize_log_line(l) for l in lines]
     except Exception:
