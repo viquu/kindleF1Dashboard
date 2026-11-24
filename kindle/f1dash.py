@@ -38,6 +38,9 @@ SSH 就知道还能撑多久。
 醒,挂起电流约 3mA,醒来直接回 active 且 Wi-Fi 自动重连。睡眠模式
 (sleep,见"睡眠模式"一节)就是这条 A 路线:每小时醒、拉图、刷屏、上报、
 再睡;实测外推平均约 4–6mAh/h(6–10 天/充),常显 27.8mAh/h 仅约 32 小时。
+注意:闹钟必须写相对格式 "+N"——本机 RTC 从没被设置过(1970 出厂默认),
+绝对 epoch 目标在 RTC 看来是约 56 年后,驱动悄悄拒设(写不报错、读回 0),
+2026-11-25 01:00/02:00 两轮因此没睡着;相对格式不受两口钟偏差影响。
 powerd 路线(B)机制上也通,但醒后是 screenSaver 状态、Wi-Fi 不连,且监听器
 常驻会把 readyToSuspend 倒计时卡在 10,故睡眠模式不用 B 路线。
 """
@@ -3569,8 +3572,17 @@ def always_cycle():
 #   1. 闹钟没设上 / 读回校验不过 → 绝不睡,清醒等到下个整点再试。
 #   2. echo mem 立刻返回(<10 秒) → 当作入睡失败,退避,清醒等到下个整点,
 #      绝不原地重睡(否则一分钟能烧几十轮)。
-#   3. 闹钟是绝对 epoch(下个整点),不是相对秒数;读回允许 ±5 秒。
+#   3. 闹钟是相对秒数("+N",到下个整点还有几秒),不是绝对 epoch——绝对
+#      格式已证实死在设备上(见下),读回按 RTC 时钟 +N 校验,允许 ±5 秒。
 #   4. 剩不到 30 秒就不睡了,清醒等过去(省一次挂起/唤醒折腾)。
+#
+# 绝对格式之死(2026-11-25 07:02 遥测确诊,Ken 的主意:守护自己读双时
+# 钟):RTC 从没被设置过,停在出厂默认值 1970-01-03 10:28:15(rtc_epoch
+# 210495,偏差 -1795350827)、自由走字。绝对 epoch 目标在 RTC 看来是约
+# 56 年后,驱动悄悄拒设(写不报错、读回 0)。相对 "+N" 不受此影响:内核
+# 按 RTC 自己的时钟加 N,Zcode 2026-11-24 实测 +120 唤醒于 118 秒、
+# +600 唤醒于 598 秒。读回校验也必须用 RTC 时钟(rtc_now + N),不能用
+# 系统时间——两口钟差了约 56 年。
 # 任何一步失败,设备都只是"这小时没睡、按常显耗电",屏和遥测都不丢;
 # 万一真睡死(闹钟失效),按一下电源键即醒——挂起本身不锁死设备。
 
@@ -3604,21 +3616,30 @@ def _read_wakealarm(path=None):
         return None
 
 
-def _verify_wakealarm(target, path=None):
-    """读回值与目标差 ≤ 容差即通过;读不到一律不通过。"""
+def _verify_wakealarm_rel(seconds, path=None, rtc_now=None):
+    """读回闹钟值,与 RTC 时钟 + seconds 的差 ≤ 容差即通过。
+
+    相对 "+N" 写入后,内核把 RTC 当时的时刻 +N 存为闹钟,读回是 RTC
+    域的绝对值;所以期望值 = rtc_now + N,必须用 RTC 时钟算,不能用系
+    统时间(两口钟差约 56 年)。rtc_now 缺省现读 _read_rtc_epoch();
+    RTC 读不到一律不通过(验不出来就不睡)。读不到闹钟也不通过。"""
+    if rtc_now is None:
+        rtc_now = _read_rtc_epoch()
+    if rtc_now is None:
+        return False
     readback = _read_wakealarm(path)
     if readback is None:
         return False
-    return abs(readback - int(target)) <= _WAKEALARM_TOLERANCE_S
+    return abs(readback - (int(rtc_now) + int(seconds))) <= _WAKEALARM_TOLERANCE_S
 
 
 # ---------------- RTC 诊断(2026-11-25,Ken 的主意:守护自己读双时钟) ----------------
 # 睡眠模式 01:00/02:00 两轮闹钟写下去没报错、读回却是 0,设备从没睡着。
-# 假设:RTC 走本地时间(UTC+8),绝对 epoch 目标在 RTC 看来是 7 小时前,
-# 驱动悄悄拒设。Zcode 的相对闹钟(+120/+600)全通,绝对格式从没上过设备。
-# 本节只做诊断、不改闹钟格式:每轮遥测带 sys/rtc 双时钟与偏差,失败的
-# 设闹钟尝试也在日志里写明 RTC 当时认为的时刻,下个整点直接在遥测里
-# 看偏差,不用再 SSH 上去查。读不到一律 None,诊断永不拖垮一轮。
+# 07:02 遥测确诊:RTC 从没被设置过,停在出厂默认 1970-01-03 10:28:15,
+# 绝对 epoch 目标在 RTC 看来是约 56 年后,驱动悄悄拒设。诊断节只做读
+# 时钟(每轮遥测带 sys/rtc 双时钟与偏差,失败的设闹钟尝试也在日志里写
+# 明 RTC 当时认为的时刻);闹钟格式已改相对 "+N"(见 _set_wakealarm),
+# 读回校验同样用本节的 RTC 时钟。
 def _parse_rtc_time_text(txt, now=None):
     """解析 sysfs rtc time 文本为 epoch;失败 None。
 
@@ -3692,28 +3713,47 @@ def _rtc_diag():
             "wakealarm": _read_wakealarm()}
 
 
-def _set_wakealarm(target, path=None):
-    """设 rtc1 闹钟到绝对 epoch target,先清旧闹钟、写后读回校验。
+def _write_wakealarm_raw(text, path=None):
+    """向 wakealarm 节点写原始文本;成功 True,失败 False(已记日志)。
 
-    写失败 / 读回不符都返回 False,调用方绝不入睡。清旧闹钟失败只记
-    日志(写新值会覆盖它),不作为否决条件。"""
+    单独抽出来只为可测:测试里桩掉它可以模拟内核行为——内核收到 "+N"
+    会按 RTC 自己的时钟加 N 再存,读回是 RTC 域的绝对值;真 sysfs 上
+    写 "+N" 就是原样落盘,由内核解析。"""
+    try:
+        with open(path or RTC_WAKEALARM, "w") as f:
+            f.write(text)
+        return True
+    except Exception as exc:
+        log("sleep: write wakealarm failed: %r" % exc)
+        return False
+
+
+def _set_wakealarm(seconds, path=None, rtc_now=None):
+    """设 rtc1 闹钟:相对格式 "+N"(N 秒后唤醒),先清旧闹钟、写后读回校验。
+
+    绝对 epoch 已死:本机 RTC 从没被设置过(1970 出厂默认),绝对目标在
+    RTC 看来是约 56 年后,驱动写时不报错、读回却是 0。相对 "+N" 是唯
+    一证实可行的格式(Zcode 2026-11-24:+120 唤醒于 118 秒,+600 唤醒于
+    598 秒),内核按 RTC 自己的时钟加 N,不受两口钟偏差影响。
+    seconds 必须 >0;写失败 / RTC 读不到 / 读回不符都返回 False,调用
+    方绝不入睡。清旧闹钟失败只记日志(写新值会覆盖它),不作为否决条件。"""
+    seconds = int(seconds)
+    if seconds <= 0:
+        log("sleep: refusing non-positive alarm offset %d" % seconds)
+        return False
     path = path or RTC_WAKEALARM
     try:
         with open(path, "w") as f:
             f.write("0")   # 清掉上一轮可能残留的旧闹钟
     except Exception as exc:
         log("sleep: clear stale alarm failed: %r" % exc)
-    try:
-        with open(path, "w") as f:
-            f.write(str(int(target)))
-    except Exception as exc:
-        log("sleep: write wakealarm failed: %r" % exc)
+    if not _write_wakealarm_raw("+%d" % seconds, path):
         return False
-    if not _verify_wakealarm(target, path):
+    if not _verify_wakealarm_rel(seconds, path, rtc_now=rtc_now):
         diag = _rtc_diag()
-        log("sleep: wakealarm readback mismatch (target %d, read %s, "
+        log("sleep: wakealarm readback mismatch (relative +%ds, read %s, "
             "rtc=%s, skew=%s)"
-            % (target, _read_wakealarm(path), diag["rtc_epoch"],
+            % (seconds, _read_wakealarm(path), diag["rtc_epoch"],
                diag["rtc_skew_s"]))
         return False
     return True
@@ -3763,15 +3803,17 @@ def _sleep_until_boundary(target, interval):
         log("sleep: only %.0fs to next boundary; waiting awake" % remain)
         _awake_wait_until(target, interval)
         return dict(_SLEEP_STATE)
-    if not _set_wakealarm(int(target)):
+    if not _set_wakealarm(int(remain)):
         _SLEEP_STATE["sleep_failures"] += 1
         log("sleep: alarm set/verify failed; waiting awake (failures=%d)"
             % _SLEEP_STATE["sleep_failures"])
         _awake_wait_until(target, interval)
         return dict(_SLEEP_STATE)
     diag = _rtc_diag()
-    log("sleep: alarm set for %s (in %.0fs, rtc=%s, skew=%s); suspending"
-        % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(target + 8 * 3600)),
+    log("sleep: alarm set relative +%ds for %s (in %.0fs, rtc=%s, "
+        "skew=%s); suspending"
+        % (remain,
+           time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(target + 8 * 3600)),
            remain, diag["rtc_epoch"], diag["rtc_skew_s"]))
     keep_awake(False)   # 撤防入睡,挂起才能真正发生
     t_before = time.time()
