@@ -1691,6 +1691,97 @@ def _weather_lines(day):
     return lines
 
 
+def _wx_kind(code):
+    """WMO 天气码 → 图标种类(晴/多云/阴/雾/雨/雪/雷);未知码按阴处理。"""
+    if code == 0:
+        return "clear"
+    if code in (1, 2):
+        return "partly"
+    if code in (45, 48):
+        return "fog"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "snow"
+    if code in (95, 96, 99):
+        return "storm"
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82):
+        return "rain"
+    return "cloudy"
+
+
+def _draw_weather_icon(d, x0, y0, x1, y1, code):
+    """天气图标(设计区坐标 box 内):纯黑剪影,Pillow 图元手绘,不依赖图标字体。
+
+    KPW1 是灰度墨水屏,远看只能认大块形状:太阳用实心圆+射线,云用
+    实心云团(三个圆+底座拼成,无内线),雨/雪/雷/雾在云下加雨线/雪花/
+    闪电/横线。细线描边在 6 寸屏上远看会糊成灰,实心剪影最稳。
+    box 越小图标越简:小尺寸(周末盒)只画云/太阳主体,不画射线细节。
+    """
+    import math
+
+    kind = _wx_kind(code)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    s = min(x1 - x0, y1 - y0)
+
+    def ell(ax, ay, bx, by):
+        d.ellipse([fs(ax), fy(ay), fs(bx), fy(by)], fill=0)
+
+    def rect(ax, ay, bx, by):
+        d.rectangle([fs(ax), fy(ay), fs(bx), fy(by)], fill=0)
+
+    def seg(ax, ay, bx, by, w=3):
+        d.line([fs(ax), fy(ay), fs(bx), fy(by)], fill=0, width=lw(w))
+
+    def sun(sx, sy, r, rays=True):
+        ell(sx - r, sy - r, sx + r, sy + r)
+        if rays and s >= 60:
+            for k in range(8):
+                a = math.pi / 4 * k
+                dx, dy = math.cos(a), math.sin(a)
+                seg(sx + dx * r * 1.45, sy + dy * r * 1.45,
+                    sx + dx * r * 1.85, sy + dy * r * 1.85, 3)
+
+    def cloud(ccx, ccy, cw, ch):
+        # 三个圆 + 底座,全实心,拼成无内线的云团
+        ell(ccx - cw * 0.42, ccy - ch * 0.28, ccx - cw * 0.02, ccy + ch * 0.36)
+        ell(ccx - cw * 0.18, ccy - ch * 0.52, ccx + cw * 0.26, ccy + ch * 0.36)
+        ell(ccx + cw * 0.12, ccy - ch * 0.22, ccx + cw * 0.46, ccy + ch * 0.36)
+        rect(ccx - cw * 0.42, ccy, ccx + cw * 0.42, ccy + ch * 0.36)
+
+    if kind == "clear":
+        sun(cx, cy, s * 0.24)
+    elif kind == "partly":
+        sun(cx - s * 0.18, cy - s * 0.16, s * 0.15)
+        cloud(cx + s * 0.06, cy + s * 0.08, s * 0.72, s * 0.40)
+    elif kind == "cloudy":
+        cloud(cx, cy, s * 0.90, s * 0.50)
+    elif kind == "fog":
+        cloud(cx, cy - s * 0.12, s * 0.85, s * 0.42)
+        for i, yy in enumerate((0.20, 0.32, 0.44)):
+            w2 = s * (0.38 - 0.06 * i)
+            seg(cx - w2, cy + s * yy, cx + w2, cy + s * yy, 3)
+    elif kind == "rain":
+        cloud(cx, cy - s * 0.10, s * 0.85, s * 0.44)
+        for dx in (-0.22, 0.0, 0.22):
+            seg(cx + s * dx, cy + s * 0.22, cx + s * (dx - 0.05), cy + s * 0.38, 3)
+    elif kind == "snow":
+        cloud(cx, cy - s * 0.10, s * 0.85, s * 0.44)
+        for dx in (-0.22, 0.0, 0.22):
+            px, py = cx + s * dx, cy + s * 0.30
+            r = s * 0.055
+            seg(px - r, py, px + r, py, 2)
+            seg(px - r * 0.7, py - r * 0.7, px + r * 0.7, py + r * 0.7, 2)
+            seg(px - r * 0.7, py + r * 0.7, px + r * 0.7, py - r * 0.7, 2)
+    else:  # storm
+        cloud(cx, cy - s * 0.10, s * 0.85, s * 0.44)
+        # 闪电收在图标框内,不伸到下方的天气词上
+        d.polygon([(fs(cx + s * 0.08), fy(cy + s * 0.16)),
+                   (fs(cx - s * 0.08), fy(cy + s * 0.36)),
+                   (fs(cx + s * 0.01), fy(cy + s * 0.36)),
+                   (fs(cx - s * 0.05), fy(cy + s * 0.48)),
+                   (fs(cx + s * 0.12), fy(cy + s * 0.30)),
+                   (fs(cx + s * 0.03), fy(cy + s * 0.30))], fill=0)
+
+
 def _draw_morning(d, data, font, text, cjk, ctext):
     """晨报屏 v2(设计稿 §2):页眉 70 / 天气 266 / 头条 297 / 底部三联 117 / 状态栏 34。"""
     now_bj = data.get("now_bj") or _beijing_now()
@@ -1698,14 +1789,15 @@ def _draw_morning(d, data, font, text, cjk, ctext):
     d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
     _brief_header(d, font, text, ctext, cjk, now_bj, "MORNING BRIEFING", upd)
 
-    # 天气 78–344:大字温差 + 天气词 + 降雨/湿度/日出日落 + 穿衣提示 + 明日预告 + 通勤黑条
+    # 天气 78–344:左大字温差 + 降雨/湿度行,右大图标 + 天气词(远看先认图标)
     w = data.get("weather") or {}
     today, tomorrow = w.get("today"), w.get("tomorrow")
     if today:
         text(28, 92, "%d°–%d°" % (today["low"], today["high"]), font(True, 46))
-        ctext(210, 98, _wx_cn(today), 20, bold=True)
+        _draw_weather_icon(d, 400, 80, 560, 180, today.get("code"))
+        ctext(480, 182, _wx_cn(today), 22, bold=True, anchor="ma")
         for i, line in enumerate(_weather_lines(today)):
-            ctext(210, 130 + i * 26, line, 15)
+            ctext(28, 152 + i * 26, line, 15)
         tip = _clothing_tip(today)
         if tip:
             ctext(28, 200, tip, 15, bold=True)
@@ -1774,16 +1866,17 @@ def _draw_evening(d, data, font, text, cjk, ctext):
     d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
     _brief_header(d, font, text, ctext, cjk, now_bj, "EVENING BRIEFING", upd)
 
-    # 明日天气 78–328:明日大字 + 降雨/湿度/日出日落 + 后天预告 + 明早通勤黑条
+    # 明日天气 78–328:左大字 + 降雨/湿度行,右大图标 + 天气词(与晨报同版式)
     w = data.get("weather") or {}
     tomorrow = w.get("tomorrow")
     days = w.get("days") or []
     day_after = days[2] if len(days) > 2 else None
     if tomorrow:
         text(28, 92, "%d°–%d°" % (tomorrow["low"], tomorrow["high"]), font(True, 46))
-        ctext(210, 98, _wx_cn(tomorrow), 20, bold=True)
+        _draw_weather_icon(d, 400, 80, 560, 180, tomorrow.get("code"))
+        ctext(480, 182, _wx_cn(tomorrow), 22, bold=True, anchor="ma")
         for i, line in enumerate(_weather_lines(tomorrow)):
-            ctext(210, 130 + i * 26, line, 15)
+            ctext(28, 152 + i * 26, line, 15)
     else:
         ctext(28, 92, "明日天气暂无数据", 16, bold=True)
     if day_after:
