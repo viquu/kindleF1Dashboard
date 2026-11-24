@@ -3519,6 +3519,11 @@ def always_on_mode(interval=None):
     if not interval:
         interval = os.environ.get("F1DASH_ALWAYSON_INTERVAL") or ALWAYS_INTERVAL
     interval = int(interval)
+    # 覆盖文件缺失时的回落基准:必须是启动时定下的 interval,不能用上一轮
+    # 已被覆盖改写过的 interval,否则 set_debug false 删掉覆盖文件后,
+    # _read_interval_override 会把 300 当底数返回,循环永远停在 5 分钟一轮
+    # (2026-11-24 实测 bug:上报显示 3600,实际仍是 300 秒一轮)。
+    base_interval = interval
     try:
         with open("/var/run/f1dash_alwayson.pid", "w") as f:
             f.write(str(os.getpid()))
@@ -3537,7 +3542,7 @@ def always_on_mode(interval=None):
         if _REQUEST_EXIT:
             log("always-on exiting on remote command (set_mode screensaver)")
             return
-        interval = _read_interval_override(interval)
+        interval = _read_interval_override(base_interval)
         nap = _next_grid_sleep(interval)
         t0 = time.time()
         time.sleep(nap)
