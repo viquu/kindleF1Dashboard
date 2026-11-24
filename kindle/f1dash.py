@@ -2892,6 +2892,8 @@ def _telemetry_snapshot(extra=None):
             "last_sleep_s": _SLEEP_STATE["last_sleep_s"],
             "last_wake_error_s": _SLEEP_STATE["last_wake_error_s"],
             "sleep_failures": _SLEEP_STATE["sleep_failures"]}
+    # RTC 诊断(2026-11-25):双时钟 + 偏差 + 当前闹钟读回,两模式都带。
+    snap.update(_rtc_diag())
     try:
         st = battery_status()
     except Exception:
@@ -2934,6 +2936,11 @@ def _post_telemetry(extra=None):
     """POST 一份遥测到 Oracle;成功 True,失败只记日志返回 False,永不抛异常。"""
     try:
         snap = _telemetry_snapshot(extra)
+        skew = snap.get("rtc_skew_s")
+        log("rtc diag: sys=%d rtc=%s skew=%s wakealarm=%s"
+            % (snap.get("sys_epoch"), snap.get("rtc_epoch"),
+               ("%+d" % skew) if skew is not None else "?",
+               snap.get("wakealarm")))
         res = _http_json(TELEMETRY_URL, payload=snap, timeout=15)
         if isinstance(res, dict) and res.get("ok"):
             log("telemetry posted: pct=%s pull=%s" % (snap.get("battery_pct"),
@@ -3568,6 +3575,9 @@ def always_cycle():
 # 万一真睡死(闹钟失效),按一下电源键即醒——挂起本身不锁死设备。
 
 RTC_WAKEALARM = "/sys/class/rtc/rtc1/wakealarm"  # pmic_rtc 的闹钟节点
+RTC_SINCE_EPOCH = "/sys/class/rtc/rtc1/since_epoch"  # rtc1 自 1970 的秒数
+RTC_TIME = "/sys/class/rtc/rtc1/time"                 # rtc1 时间 "YYYY-MM-DD HH:MM:SS"
+RTC_DEV = "/dev/rtc1"                                 # ioctl RTC_RD_TIME 兜底
 SYSFS_POWER_STATE = "/sys/power/state"            # 写 "mem" 即挂起
 SLEEP_MIN_SECONDS = 30        # 到下个整点不足此时长:清醒等,不挂起
 SLEEP_IMMEDIATE_RETURN_S = 10  # echo mem 回来得比这快:入睡失败,退避
@@ -3602,6 +3612,86 @@ def _verify_wakealarm(target, path=None):
     return abs(readback - int(target)) <= _WAKEALARM_TOLERANCE_S
 
 
+# ---------------- RTC 诊断(2026-11-25,Ken 的主意:守护自己读双时钟) ----------------
+# 睡眠模式 01:00/02:00 两轮闹钟写下去没报错、读回却是 0,设备从没睡着。
+# 假设:RTC 走本地时间(UTC+8),绝对 epoch 目标在 RTC 看来是 7 小时前,
+# 驱动悄悄拒设。Zcode 的相对闹钟(+120/+600)全通,绝对格式从没上过设备。
+# 本节只做诊断、不改闹钟格式:每轮遥测带 sys/rtc 双时钟与偏差,失败的
+# 设闹钟尝试也在日志里写明 RTC 当时认为的时刻,下个整点直接在遥测里
+# 看偏差,不用再 SSH 上去查。读不到一律 None,诊断永不拖垮一轮。
+def _parse_rtc_time_text(txt, now=None):
+    """解析 sysfs rtc time 文本为 epoch;失败 None。
+
+    完整格式 "YYYY-MM-DD HH:MM:SS";老内核若只有 "HH:MM:SS",就配系
+    统时钟当天的 UTC 日期(只做诊断,至多差一天,偏差仍可辨)。"""
+    try:
+        txt = txt.strip()
+        st = time.strptime(txt[:19], "%Y-%m-%d %H:%M:%S")
+        return calendar.timegm(st)
+    except Exception:
+        pass
+    try:
+        st = time.strptime(txt.strip()[:8], "%H:%M:%S")
+        base = time.gmtime(now if now is not None else time.time())
+        return calendar.timegm((base.tm_year, base.tm_mon, base.tm_mday,
+                                st.tm_hour, st.tm_min, st.tm_sec,
+                                0, 0, -1))
+    except Exception:
+        return None
+
+
+def _rtc_time_tuple_to_epoch(vals):
+    """struct rtc_time 的 9 个 int → epoch(年=tm_year+1900,月=tm_mon+1)。"""
+    try:
+        st = (vals[5] + 1900, vals[4] + 1, vals[3],
+              vals[2], vals[1], vals[0], 0, 0, -1)
+        return calendar.timegm(st)
+    except Exception:
+        return None
+
+
+def _read_rtc_epoch_ioctl(dev=None):
+    """ioctl RTC_RD_TIME(0x80247009)读 /dev/rtc1;sysfs 节点缺失时的兜底。"""
+    try:
+        import fcntl
+        import struct
+        with open(dev or RTC_DEV, "rb") as f:
+            buf = fcntl.ioctl(f.fileno(), 0x80247009,
+                              struct.pack("9i", *([0] * 9)))
+        return _rtc_time_tuple_to_epoch(struct.unpack("9i", buf))
+    except Exception:
+        return None
+
+
+def _read_rtc_epoch(since_path=None, time_path=None, dev=None):
+    """读 rtc1 时钟的 epoch 秒:since_epoch → time 文本 → ioctl 兜底。
+
+    全部失败返回 None,永不抛异常。"""
+    try:
+        with open(since_path or RTC_SINCE_EPOCH) as f:
+            return int(f.read().strip())
+    except Exception:
+        pass
+    try:
+        with open(time_path or RTC_TIME) as f:
+            epoch = _parse_rtc_time_text(f.read())
+        if epoch is not None:
+            return epoch
+    except Exception:
+        pass
+    return _read_rtc_epoch_ioctl(dev)
+
+
+def _rtc_diag():
+    """本轮 RTC 诊断:系统/RTC 双时钟 + 偏差(rtc - sys) + 当前闹钟读回。"""
+    now = int(time.time())
+    rtc = _read_rtc_epoch()
+    return {"sys_epoch": now,
+            "rtc_epoch": rtc,
+            "rtc_skew_s": (rtc - now) if rtc is not None else None,
+            "wakealarm": _read_wakealarm()}
+
+
 def _set_wakealarm(target, path=None):
     """设 rtc1 闹钟到绝对 epoch target,先清旧闹钟、写后读回校验。
 
@@ -3620,8 +3710,11 @@ def _set_wakealarm(target, path=None):
         log("sleep: write wakealarm failed: %r" % exc)
         return False
     if not _verify_wakealarm(target, path):
-        log("sleep: wakealarm readback mismatch (target %d, read %s)"
-            % (target, _read_wakealarm(path)))
+        diag = _rtc_diag()
+        log("sleep: wakealarm readback mismatch (target %d, read %s, "
+            "rtc=%s, skew=%s)"
+            % (target, _read_wakealarm(path), diag["rtc_epoch"],
+               diag["rtc_skew_s"]))
         return False
     return True
 
@@ -3676,9 +3769,10 @@ def _sleep_until_boundary(target, interval):
             % _SLEEP_STATE["sleep_failures"])
         _awake_wait_until(target, interval)
         return dict(_SLEEP_STATE)
-    log("sleep: alarm set for %s (in %.0fs); suspending"
+    diag = _rtc_diag()
+    log("sleep: alarm set for %s (in %.0fs, rtc=%s, skew=%s); suspending"
         % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(target + 8 * 3600)),
-           remain))
+           remain, diag["rtc_epoch"], diag["rtc_skew_s"]))
     keep_awake(False)   # 撤防入睡,挂起才能真正发生
     t_before = time.time()
     try:
