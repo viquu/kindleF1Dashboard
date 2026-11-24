@@ -10,7 +10,8 @@
     f1dash.py pull      从云端下载渲染好的屏保图(CLOUD_URL),失败保留旧图
     f1dash.py refresh   同 pull:只下载云端成图,云端不可达保留上一张屏保
     f1dash.py service   守护进程:唤醒即刷新 + 清醒时每 30 分钟刷新 + 可选一键回睡
-    f1dash.py alwayson  常显守护:永不入睡,每小时拉图 → 叠加电量角标 → eips 全屏显示
+    f1dash.py alwayson  常显守护:每小时拉图 → 叠加电量角标 → eips 全屏显示
+    (alwayson/sleep 两种子模式,远程 set_mode 切换;见"睡眠模式"一节)
     f1dash.py battreport  汇总常显期间电池采样 CSV,实测电流外推整块电池续航
     f1dash.py telemetry  上报一份遥测 JSON 到 Oracle(电量/拉图/进程,见遥测一节)
     f1dash.py command  拉取并执行 Oracle 上的 command.json(白名单动作,见遥测一节)
@@ -20,20 +21,25 @@ Kindle 只做"唤醒 → 下载成图"的瘦客户端,把唤醒刷新从几十�
 云端不可达不做本机渲染,直接保留最后一张屏保图(渲染代码保留,供云端与开发预览复用)。
 一键回睡(auto_sleep 标志文件):信息牌模式下唤醒 → 刷新 → 模拟电源键
 自动入睡,锁屏永远显示最新图;想正常阅读时在 KUAL 菜单关闭开关。
-常显模式(alwayson):设备永不入睡,每小时整点拉云端图 eips 全屏重显示;RTC 无法
-从挂起唤醒(见下),常显就是用续航换全天候实时。Wi-Fi 整点硬开、拉图后保持
-ALWAYS_WIFI_WINDOW(默认 5 分钟)再硬关 —— 开窗可预期,SSH/运维在 :00-:05 随便
-连(2026-11-22 实测:软关 lipc enable 0 会被 wifid ~15s 翻回,形同虚设;硬关
-stop wifid + ifconfig down 可靠,off 窗口不回弹,冷启 6s 回连,路由器静态 IP
-预留无需等 DHCP;连续 3 轮失败 fail-open 退回 Wi-Fi 常开,宁可多耗电不把屏
-死在旧图上;/mnt/us/f1dash/wifi_hold 标志存在时本轮豁免硬关,供长时运维)。
-framework 停了屏上看不到状态栏电量,拉图后本地把电量角标(电池图标+百分比+
-实测外推续航,低电加顶部警告条)叠进底部白边,不必 SSH 就知道还能撑多久。
+常显模式(alwayson):设备每小时整点拉云端图 eips 全屏重显示;Wi-Fi 整点硬开、
+拉图后保持 ALWAYS_WIFI_WINDOW(默认 5 分钟)再硬关 —— 开窗可预期,SSH/运维
+在 :00-:05 随便连(2026-11-22 实测:软关 lipc enable 0 会被 wifid ~15s 翻回,
+形同虚设;硬关 stop wifid + ifconfig down 可靠,off 窗口不回弹,冷启 6s 回连,
+路由器静态 IP 预留无需等 DHCP;连续 3 轮失败 fail-open 退回 Wi-Fi 常开,
+宁可多耗电不把屏死在旧图上;/mnt/us/f1dash/wifi_hold 标志存在时本轮豁免
+硬关,供长时运维)。framework 停了屏上看不到状态栏电量,拉图后本地把电量
+角标(电池图标+百分比+实测外推续航,低电加顶部警告条)叠进底部白边,不必
+SSH 就知道还能撑多久。
 
-说明:本设备(PW1 5.6.1.1)的外部 RTC 闹钟无法从挂起唤醒内核
-(sysfs wakealarm 触发但无效,powerd rtcWakeup 不接受外部设置),
-故设备休眠时守护进程冻结,无法在睡眠中刷新;F1 数据变化不频繁,
-云端出图 + 唤醒即拉已足够实时。
+说明:本设备(PW1 5.6.1.1)的 RTC 定时唤醒曾经判过死刑,2026-11-24 重测
+推翻——旧结论错在两处:用的 rtc0(mxc_rtc)底下根本没有 wakealarm 节点
+(结构性不存在),powerd rtcWakeup 不加 -i 才报 lipcErrNoSuchProperty。
+实测 rtc1(pmic_rtc) + echo mem:120 秒闹钟 118 秒醒 ×3、600 秒闹钟 598 秒
+醒,挂起电流约 3mA,醒来直接回 active 且 Wi-Fi 自动重连。睡眠模式
+(sleep,见"睡眠模式"一节)就是这条 A 路线:每小时醒、拉图、刷屏、上报、
+再睡;实测外推平均约 4–6mAh/h(6–10 天/充),常显 27.8mAh/h 仅约 32 小时。
+powerd 路线(B)机制上也通,但醒后是 screenSaver 状态、Wi-Fi 不连,且监听器
+常驻会把 readyToSuspend 倒计时卡在 10,故睡眠模式不用 B 路线。
 """
 
 import base64
@@ -2159,10 +2165,11 @@ def service_mode():
 
 # ---------------- 常显模式(always-on) ----------------
 #
-# 与 service 模式互补的信息牌形态:设备永不入睡,每小时整点拉一次成图(Wi-Fi
+# 与 service 模式互补的信息牌形态:设备每小时整点拉一次成图(Wi-Fi
 # 整点开、保持 ALWAYS_WIFI_WINDOW 再硬关,见 wifi()/always_cycle),成图或电量
-# 角标有变才 eips 全屏重显示。PW1 的 RTC 闹钟
-# 无法从挂起唤醒内核(见文件头),睡着就刷不了;常显等于用续航换全天候实时。
+# 角标有变才 eips 全屏重显示。常显子模式下永不入睡;睡眠子模式(sleep,见
+# "睡眠模式"一节)则每轮结束后挂起、由 rtc1 闹钟在下个整点唤醒——2026-11-24
+# 重测证实 rtc1 + echo mem 可靠(约 3mA),旧的"RTC 无法唤醒"结论已推翻。
 # 前置光始终关闭 —— 常显模式下它是最大的单一耗电源。
 # 循环内每轮重申防入睡标志并重试熄灯,防框架重置。
 
@@ -2708,6 +2715,43 @@ SELF_UPDATE_MANIFEST_URL = "http://149.118.42.190:8080/f1/f1dash.version.json"
 SELF_UPDATE_URL = "http://149.118.42.190:8080/f1/f1dash.py"
 LAST_COMMAND_FILE = "/mnt/us/f1dash/last_command.json"
 INTERVAL_OVERRIDE_FILE = "/mnt/us/f1dash/interval_override"
+MODE_FILE = "/mnt/us/f1dash/mode"  # 守护子模式:"alwayson" | "sleep"(远程 set_mode 写)
+# 睡眠统计(本进程内累计,遥测带回):wake_count 成功唤醒轮数,
+# last_sleep_s 上次实际睡了几秒,last_wake_error_s 上次唤醒误差
+# (实际 - 预期,负值多为设闹钟到真正入睡的 1-2 秒开销),sleep_failures
+# 连续入睡失败次数(成功唤醒清零)。
+_SLEEP_STATE = {"wake_count": 0, "last_sleep_s": None,
+                "last_wake_error_s": None, "sleep_failures": 0}
+
+
+def _read_mode():
+    """当前守护子模式;文件缺失/损坏/非法值一律回落 alwayson。
+
+    回落方向是故意的:文件丢了设备保持常显、可达可修,绝不因一个文件
+    损坏就睡过去失联。"""
+    try:
+        with open(MODE_FILE) as f:
+            mode = f.read().strip().lower()
+        if mode in ("alwayson", "sleep"):
+            return mode
+    except Exception:
+        pass
+    return "alwayson"
+
+
+def _write_mode(mode):
+    """原子写模式文件;成功 True,失败 False(调用方据此拒绝指令)。"""
+    if mode not in ("alwayson", "sleep"):
+        return False
+    try:
+        tmp = MODE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(mode + "\n")
+        os.replace(tmp, MODE_FILE)
+        return True
+    except Exception as exc:
+        log("mode file write failed: %r" % exc)
+        return False
 _DAEMON_START = time.time()
 _REQUEST_EXIT = False
 # 最近一次自更新失败的原因(供 update_code 指令带回;成功/未开始时为 None)。
@@ -2833,7 +2877,7 @@ def _telemetry_snapshot(extra=None):
     """本轮遥测快照:电量/放电速率/Wi-Fi/拉图/进程/成图,全部 best-effort。"""
     snap = {"ts": int(time.time()),
             "time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() + 8 * 3600)),
-            "mode": "alwayson",
+            "mode": _read_mode(),
             "pid": os.getpid(),
             "uptime_s": int(time.time() - _DAEMON_START),
             "code_sha": (_sha256_file(os.path.abspath(__file__)) or "")[:12],
@@ -2842,7 +2886,12 @@ def _telemetry_snapshot(extra=None):
             "image_sha": (_sha256_file(SS_OUT) or "")[:12],
             # 调试模式状态:Muse 从上报一眼看出设备是不是还在调试态,不用猜。
             "debug": os.path.exists(WIFI_HOLD_FLAG),
-            "interval_seconds": _read_interval_override(ALWAYS_INTERVAL)}
+            "interval_seconds": _read_interval_override(ALWAYS_INTERVAL),
+            # 睡眠统计(常显模式下全是 0/None,只有 sleep 模式才有值)。
+            "wake_count": _SLEEP_STATE["wake_count"],
+            "last_sleep_s": _SLEEP_STATE["last_sleep_s"],
+            "last_wake_error_s": _SLEEP_STATE["last_wake_error_s"],
+            "sleep_failures": _SLEEP_STATE["sleep_failures"]}
     try:
         st = battery_status()
     except Exception:
@@ -3018,6 +3067,11 @@ def _execute_command(cmd):
     update_code(别名 pull_latest_code) | upload_log(别名 fetch_log) |
     set_debug。set_debug 调试模式:debug=true 时 Wi-Fi 常开 + 5 分钟一轮
     (不用等整点 5 分钟窗口),只在插电时用;debug=false 恢复每小时。
+    set_mode 的 mode:alwayson(常显,永不入睡)| sleep(睡眠模式,每轮结束
+    挂起、rtc1 闹钟下个整点唤醒)| screensaver(恢复原生屏保并退出守护)。
+    alwayson/sleep 只写模式文件、下一轮起生效,守护不重启;切回 alwayson
+    也一样从 sleep 模式的唤醒轮里生效,无需碰设备。screensaver 会结束
+    守护进程,三者都要 confirm=true。
     upload_log 把 service.log 后 50 行 + battery.csv 后 20 行 POST 到
     Oracle /api/log,成功才算 ok,结果下次上报带回;自更新重启后首轮还会
     自动上传一次(见 _maybe_auto_upload_log),不用再下一条指令。
@@ -3092,8 +3146,17 @@ def _execute_command(cmd):
             if cmd.get("confirm") is not True:
                 return {"action": action, "ok": False, "error": "confirm=true required"}
             mode = cmd.get("mode")
-            if mode == "alwayson":
-                return {"action": action, "ok": True, "mode": mode, "note": "already alwayson"}
+            if mode in ("alwayson", "sleep"):
+                # 必须真写文件(旧版只返回 already alwayson、不写文件):
+                # 从 sleep 切回 alwayson 全靠这个文件,光返回 ok 不写,
+                # 设备就永远睡在 sleep 里出不来。
+                if not _write_mode(mode):
+                    return {"action": action, "ok": False,
+                            "error": "mode file write failed"}
+                log("command: mode set to %s (applies from next cycle)" % mode)
+                return {"action": action, "ok": True, "mode": mode,
+                        "note": "applies from next cycle; sleep mode wakes "
+                                "hourly, pulls, then suspends"}
             if mode == "screensaver":
                 # 与 always_on_stop.sh 同语义:撤防入睡、拉回框架/pillow,退出守护;
                 # 退出后设备恢复正常睡眠,锁屏显示 SS_OUT(信息牌模式)。
@@ -3483,6 +3546,270 @@ def always_cycle():
             % (time.time() - t0, net, pulled, cap or "?"))
 
 
+# ---------------- 睡眠模式(sleep,A 路线:rtc1 + echo mem) ----------------
+#
+# 2026-11-24 实测(Ken 在家,Zcode):rtc1(pmic_rtc) + `echo mem` 可靠唤醒,
+# 120 秒闹钟 118 秒醒 ×3、600 秒闹钟 598 秒醒,挂起约 3mA,醒来直接回
+# active 且 Wi-Fi 自动重连。rtc0(mxc_rtc)底下没有 wakealarm 节点,不要用。
+# powerd 路线(B)不用:醒后 screenSaver + Wi-Fi 死、监听器常驻会卡倒计时。
+#
+# 每轮(sleep_cycle):巡检 dropbear → Wi-Fi 硬开 → 拉图 → 图/电量有变才
+# 显示 → 取指令并执行 → 上报遥测 → Wi-Fi 立即硬关(没有常显的 5 分钟开
+# 窗,省电就是目的;SSH 只能在唤醒轮的 1-2 分钟里连) → 设 rtc1 闹钟到
+# 下个整点 → echo mem。醒来循环。
+#
+# 保命规则(缺一不可,见 _sleep_until_boundary):
+#   1. 闹钟没设上 / 读回校验不过 → 绝不睡,清醒等到下个整点再试。
+#   2. echo mem 立刻返回(<10 秒) → 当作入睡失败,退避,清醒等到下个整点,
+#      绝不原地重睡(否则一分钟能烧几十轮)。
+#   3. 闹钟是绝对 epoch(下个整点),不是相对秒数;读回允许 ±5 秒。
+#   4. 剩不到 30 秒就不睡了,清醒等过去(省一次挂起/唤醒折腾)。
+# 任何一步失败,设备都只是"这小时没睡、按常显耗电",屏和遥测都不丢;
+# 万一真睡死(闹钟失效),按一下电源键即醒——挂起本身不锁死设备。
+
+RTC_WAKEALARM = "/sys/class/rtc/rtc1/wakealarm"  # pmic_rtc 的闹钟节点
+SYSFS_POWER_STATE = "/sys/power/state"            # 写 "mem" 即挂起
+SLEEP_MIN_SECONDS = 30        # 到下个整点不足此时长:清醒等,不挂起
+SLEEP_IMMEDIATE_RETURN_S = 10  # echo mem 回来得比这快:入睡失败,退避
+_WAKEALARM_TOLERANCE_S = 5    # 闹钟读回与目标的允许偏差(秒)
+
+
+def _next_boundary_epoch(now, interval):
+    """interval 网格的下一个对齐点 epoch(3600 → 下个整点);严格大于 now。"""
+    return (int(now // interval) + 1) * interval
+
+
+def _seconds_to_next_boundary(now, interval):
+    """到下个整点(网格对齐点)的秒数,恒在 (0, interval] 内。"""
+    return _next_boundary_epoch(now, interval) - now
+
+
+def _read_wakealarm(path=None):
+    """读回闹钟值(epoch 秒);0=无闹钟,None=读不到(节点缺失等)。"""
+    try:
+        with open(path or RTC_WAKEALARM) as f:
+            txt = f.read().strip()
+        return int(txt) if txt else 0
+    except Exception:
+        return None
+
+
+def _verify_wakealarm(target, path=None):
+    """读回值与目标差 ≤ 容差即通过;读不到一律不通过。"""
+    readback = _read_wakealarm(path)
+    if readback is None:
+        return False
+    return abs(readback - int(target)) <= _WAKEALARM_TOLERANCE_S
+
+
+def _set_wakealarm(target, path=None):
+    """设 rtc1 闹钟到绝对 epoch target,先清旧闹钟、写后读回校验。
+
+    写失败 / 读回不符都返回 False,调用方绝不入睡。清旧闹钟失败只记
+    日志(写新值会覆盖它),不作为否决条件。"""
+    path = path or RTC_WAKEALARM
+    try:
+        with open(path, "w") as f:
+            f.write("0")   # 清掉上一轮可能残留的旧闹钟
+    except Exception as exc:
+        log("sleep: clear stale alarm failed: %r" % exc)
+    try:
+        with open(path, "w") as f:
+            f.write(str(int(target)))
+    except Exception as exc:
+        log("sleep: write wakealarm failed: %r" % exc)
+        return False
+    if not _verify_wakealarm(target, path):
+        log("sleep: wakealarm readback mismatch (target %d, read %s)"
+            % (target, _read_wakealarm(path)))
+        return False
+    return True
+
+
+def _clear_wakealarm(path=None):
+    """清闹钟(醒来后调用,防残留旧闹钟误唤醒);失败只记日志。"""
+    try:
+        with open(path or RTC_WAKEALARM, "w") as f:
+            f.write("0")
+    except Exception as exc:
+        log("sleep: clear wakealarm after wake failed: %r" % exc)
+
+
+def _suspend_once(path=None):
+    """写 "mem" 挂起;调用在写操作里冻结,醒来才返回。返回实际耗时(秒)。
+
+    必须用二进制无缓冲写:文本缓冲会把 "mem" 攥在用户态,关文件前根本
+    不触 sysfs,挂起就永远不发生。写失败(OSError 等)直接抛给调用方。"""
+    t0 = time.time()
+    with open(path or SYSFS_POWER_STATE, "wb", buffering=0) as f:
+        f.write(b"mem")
+    return time.time() - t0
+
+
+def _awake_wait_until(target, interval):
+    """清醒等到 target(分段 ≤60 秒):每段重读模式文件,切回 alwayson
+    就提前返回 False;等到目标返回 True。"""
+    while True:
+        remain = target - time.time()
+        if remain <= 0:
+            return True
+        if _read_mode() != "sleep":
+            log("sleep: mode changed during awake wait; returning")
+            return False
+        time.sleep(min(60.0, remain))
+
+
+def _sleep_until_boundary(target, interval):
+    """在 target(绝对 epoch)前入睡,醒来/失败都等到 target 才返回。
+
+    返回 _SLEEP_STATE 的副本。失败路径(闹钟失败/立刻返回/写失败)都
+    只记数 + 清醒等到下个整点,绝不原地重试 echo mem。"""
+    now = time.time()
+    remain = target - now
+    if remain < SLEEP_MIN_SECONDS:
+        log("sleep: only %.0fs to next boundary; waiting awake" % remain)
+        _awake_wait_until(target, interval)
+        return dict(_SLEEP_STATE)
+    if not _set_wakealarm(int(target)):
+        _SLEEP_STATE["sleep_failures"] += 1
+        log("sleep: alarm set/verify failed; waiting awake (failures=%d)"
+            % _SLEEP_STATE["sleep_failures"])
+        _awake_wait_until(target, interval)
+        return dict(_SLEEP_STATE)
+    log("sleep: alarm set for %s (in %.0fs); suspending"
+        % (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(target + 8 * 3600)),
+           remain))
+    keep_awake(False)   # 撤防入睡,挂起才能真正发生
+    t_before = time.time()
+    try:
+        elapsed = _suspend_once()
+    except Exception as exc:
+        elapsed = time.time() - t_before
+        _SLEEP_STATE["sleep_failures"] += 1
+        _SLEEP_STATE["last_sleep_s"] = round(elapsed, 1)
+        log("sleep: suspend failed after %.1fs: %r; waiting awake"
+            % (elapsed, exc))
+        _awake_wait_until(target, interval)
+        return dict(_SLEEP_STATE)
+    # 醒了:先清残留闹钟,再算误差。误差 = 实际睡时长 - 预期(目标 - 入睡前)。
+    _clear_wakealarm()
+    expected = target - t_before
+    wake_error = elapsed - expected
+    _SLEEP_STATE["last_sleep_s"] = round(elapsed, 1)
+    _SLEEP_STATE["last_wake_error_s"] = round(wake_error, 1)
+    if elapsed < SLEEP_IMMEDIATE_RETURN_S:
+        _SLEEP_STATE["sleep_failures"] += 1
+        log("sleep: immediate return after %.1fs (expected %.0fs); "
+            "backoff, waiting awake" % (elapsed, expected))
+        _awake_wait_until(target, interval)
+        return dict(_SLEEP_STATE)
+    _SLEEP_STATE["wake_count"] += 1
+    _SLEEP_STATE["sleep_failures"] = 0
+    log("sleep: woke after %.1fs (expected %.0fs, error %+.1fs, wakes=%d)"
+        % (elapsed, expected, wake_error, _SLEEP_STATE["wake_count"]))
+    return dict(_SLEEP_STATE)
+
+
+def sleep_cycle(interval):
+    """睡眠模式的一轮:唤醒轮工作(与 always_cycle 同款) → 挂起到下个整点。
+
+    Wi-Fi 在遥测后立即硬关,没有常显的 5 分钟开窗。拉图失败也不影响入睡
+    (闹钟与 Wi-Fi 无关,下轮再试);但调试模式(wifi_hold)下绝不睡——调试
+    就是要 Wi-Fi 常开、5 分钟一轮,睡了就没法调。轮中收到 set_mode
+    alwayson / screensaver 时也不睡,回主循环处理。"""
+    global _last_shown_pct, _wifi_fail_streak
+    t0 = time.time()
+    net = pulled = False
+    cap = "?"
+    t_reconnect = None
+    t_pull = None
+    cmd_result = None
+    try:
+        dropbear_watchdog()
+        if framework_ensure_stopped():
+            log("framework respawned; stopped it again")
+        front_light_off()
+        wifi(True)
+        t_net = time.time()
+        net = wait_network()
+        if net:
+            t_reconnect = round(time.time() - t_net, 1)
+            log("cycle: wifi up, route in %.0fs" % (time.time() - t_net))
+        else:
+            log("cycle: no network; retry wifi start sequence")
+            wifi(True)
+            t_net = time.time()
+            net = wait_network(45)
+            if net:
+                t_reconnect = round(time.time() - t_net, 1)
+                log("cycle: wifi up on retry, route in %.0fs" % (time.time() - t_net))
+        prev = _read_bytes(SS_OUT)
+        if net:
+            _t_pull0 = time.time()
+            pulled = pull_image(outs=(SS_OUT,))
+            t_pull = round(time.time() - _t_pull0, 1)
+            if not pulled:
+                log("cycle: pull failed; keep last image")
+        else:
+            log("cycle: no network; keep last image")
+        image_changed = _read_bytes(SS_OUT) != prev
+        cap = _sysfs_raw("battery_capacity")
+        try:
+            pct = int(cap.rstrip("%"))
+        except ValueError:
+            pct = None
+        if image_changed or (pct is not None and pct != _last_shown_pct):
+            shown = None
+            if os.path.exists(SS_OUT):
+                shown = ALWAYS_OUT if overlay_battery() else SS_OUT
+            elif os.path.exists(ALWAYS_OUT):
+                shown = ALWAYS_OUT
+            if shown:
+                show_fullscreen(shown, flash=image_changed)
+                if image_changed:
+                    log("cycle: image changed; refresh with fullscreen flash")
+                _last_shown_pct = pct
+                front_light_off()
+        else:
+            log("cycle: image and battery unchanged; skip eips refresh")
+        log("ip: %s" % (current_ip() or "none"))
+        # 遥测 + 远程指令 + 自更新(仅本轮联网时;自更新有新版且校验通过时
+        # 直接 exec 重启,本函数不再返回——与 always_cycle 同语义)。
+        if net:
+            cmd_result = _poll_and_execute_command()
+            if pulled:
+                _check_self_update()
+        _post_telemetry({"pull_ok": pulled, "net_ok": net,
+                         "reconnect_s": t_reconnect, "pull_s": t_pull,
+                         "command": cmd_result, "battery": cap or "?"})
+        if net:
+            _maybe_auto_upload_log()
+    finally:
+        if pulled:
+            _wifi_fail_streak = 0
+        else:
+            _wifi_fail_streak += 1
+        log("cycle done in %ds: net=%s pull=%s battery %s"
+            % (time.time() - t0, net, pulled, cap or "?"))
+    # 入睡决策:轮中可能已收到切回 alwayson / screensaver 的指令,先看模式。
+    if _REQUEST_EXIT:
+        log("sleep: exit requested (set_mode screensaver); not sleeping")
+        return
+    if _read_mode() != "sleep":
+        log("sleep: mode is now %s; staying awake" % _read_mode())
+        keep_awake(True)
+        return
+    if os.path.exists(WIFI_HOLD_FLAG):
+        # 调试模式:Wi-Fi 常开,绝不挂起;清醒等到下个整点,下轮再看。
+        log("sleep: wifi hold present (debug mode); staying awake, wifi on")
+        _awake_wait_until(_next_boundary_epoch(time.time(), interval), interval)
+        return
+    if not wifi(False):
+        log("sleep: warning: wifi hard-off NOT verified; suspending anyway "
+            "(suspend cuts the radio at the driver level)")
+    _sleep_until_boundary(_next_boundary_epoch(time.time(), interval), interval)
+
+
 def daemonize():
     """双 fork + setsid 脱离会话(设备无 nohup/setsid 命令,在 python 里做)。
 
@@ -3510,11 +3837,15 @@ def _next_grid_sleep(interval):
 
 
 def always_on_mode(interval=None):
-    """常显主循环:启动即刷一轮,之后睡到周期网格对齐点再重申防入睡并刷一轮。
+    """守护主循环:启动即刷一轮,之后按模式文件分派(alwayson/sleep)。
 
+    模式文件(/mnt/us/f1dash/mode)每轮重读,远程 set_mode 下一轮即生效,
+    守护不重启。alwayson:刷一轮 → 睡到周期网格对齐点(3600 → 整点拉图,
+    Wi-Fi 开窗 :00-:05 可预期);sleep:刷一轮 → 挂起到下个整点(见
+    sleep_cycle)。切回 alwayson 时 sleep 轮里先读到新模式、直接不睡,
+    回到常显循环——无需碰设备。
     间隔优先级:--interval 参数 > F1DASH_ALWAYSON_INTERVAL 环境变量 > 默认 3600。
-    循环对齐到网格(3600 → 整点拉图,Wi-Fi 开窗 :00-:05 可预期)。
-    实际等待超过预期 2 分钟视为发生过挂起(常显模式不该出现),记日志供排查。
+    常显分支里实际等待超过预期 2 分钟视为发生过挂起,记日志供排查。
     """
     if not interval:
         interval = os.environ.get("F1DASH_ALWAYSON_INTERVAL") or ALWAYS_INTERVAL
@@ -3529,7 +3860,8 @@ def always_on_mode(interval=None):
             f.write(str(os.getpid()))
     except Exception as exc:
         log("pidfile write failed: %r" % exc)
-    log("always-on started (interval %ds, pid %d)" % (interval, os.getpid()))
+    log("always-on started (interval %ds, pid %d, mode %s)"
+        % (interval, os.getpid(), _read_mode()))
     BatteryMeter().start()
     keep_awake(True)
     if framework_stop():
@@ -3537,11 +3869,20 @@ def always_on_mode(interval=None):
     else:
         log("warning: framework stop failed; chrome may repaint over the image")
     front_light_off()   # 停框架之后:停机会重套滑块亮度,先停再灭
-    always_cycle()
     while True:
         if _REQUEST_EXIT:
             log("always-on exiting on remote command (set_mode screensaver)")
             return
+        interval = _read_interval_override(base_interval)
+        if _read_mode() == "sleep":
+            keep_awake(False)
+            sleep_cycle(interval)
+            continue
+        keep_awake(True)
+        if framework_ensure_stopped():
+            log("framework respawned; stopped it again")
+        front_light_off()
+        always_cycle()
         interval = _read_interval_override(base_interval)
         nap = _next_grid_sleep(interval)
         t0 = time.time()
@@ -3549,11 +3890,6 @@ def always_on_mode(interval=None):
         elapsed = time.time() - t0
         if elapsed > nap + 120:
             log("warning: %ds gap in loop — system suspended?" % round(elapsed))
-        keep_awake(True)
-        if framework_ensure_stopped():
-            log("framework respawned; stopped it again")
-        front_light_off()
-        always_cycle()
 
 
 class BatteryMeter(threading.Thread):
