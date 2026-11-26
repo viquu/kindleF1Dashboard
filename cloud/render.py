@@ -11,9 +11,11 @@
                 briefing.json(Muse 提供的收盘/模拟盘/本周回顾,可选,缺了留占位)
 
 模板选择(北京时间):工作日 06:35–09:00 晨报、18:00–23:00 晚报、
-周五 18:00 起及周末 07:00–23:00 周末屏,其余时段保留原仪表盘/海报。
+周五 18:00 起及周末 07:00–23:00 周末屏;其余时段不渲染,
+保留上一张早晚报/周末屏(2026-11-27 Ken 决定去掉 F1 仪表盘/海报)。
 显式 --morning/--evening/--weekend 覆盖时间选择(调试用);--mock-*
-用离线假数据渲染对应模板(版式验证,不联网)。
+用离线假数据渲染对应模板(版式验证,不联网)。F1 仪表盘/海报的
+绘制函数仍在 kindle/f1dash.py 里,但生产渲染不再走到它们。
 
 Kindle 侧 f1dash.py pull 模式下载成图;主数据源失败时不覆盖 latest.png
 (与设备端"保留上一张屏保"的兜底语义一致),exit 1 让 systemd 记录失败。
@@ -46,16 +48,17 @@ def main():
         ok = f1dash.png_render_briefing(data, out=out)
         return 0 if ok else 1
 
-    if "--mock-race" in argv:
-        # 离线预览赛事海报版式(含排位/冲刺结果块)
-        data = f1dash.mock_data(err=False, poster=True)
-        ok = f1dash.png_render(data, out=out)
-        return 0 if ok else 1
-    if "--mock" in argv:
-        # 离线预览仪表盘版式
-        data = f1dash.mock_data(err=False)
-        ok = f1dash.png_render(data, out=out)
-        return 0 if ok else 1
+    # F1 仪表盘/海报已去掉(2026-11-27):--mock-race / --mock 不再提供。
+
+    # 非早晚报/周末时段:不拉数据、不出图,保留上一张屏。
+    # 显式 --morning/--evening/--weekend 仍按指定模板渲染(调试/预览用)。
+    explicit = [tpl for flag, tpl in (("--morning", "morning"),
+                                       ("--evening", "evening"),
+                                       ("--weekend", "weekend"))
+                if flag in argv]
+    if not explicit and f1dash.select_briefing_template() == "dashboard":
+        print("not a briefing slot; keeping previous screensaver")
+        return 0
 
     headlines = os.path.join(OUT_DIR, "headlines.json")
     briefing = os.path.join(OUT_DIR, "briefing.json")
