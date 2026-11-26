@@ -1961,7 +1961,11 @@ def _weekend_dates(now_bj):
     周一–周四(仅 --weekend 强制渲染时走到)看本周六/日。周六偏移:
     周一 +5、周二 +4、周三 +3、周四 +2、周五 +1、周六 0、周日 -1。
     """
-    base = calendar.timegm(now_bj) - 8 * 3600
+    # now_bj 已是北京时间墙钟:timegm 把它当 UTC 读出的 epoch 本身就是
+    # “北京时间日历”基准,不能再减 8 小时——减了再经 gmtime 读回的是 UTC
+    # 日期,北京时间 08:00 前会比正确日期早一天(2026-11-27 06:30 实测:
+    # 周六被标成 11月27日、周日 11月28日、下周一 11月29日)。
+    base = calendar.timegm(now_bj)
     wd = now_bj.tm_wday
     sat_off = -1 if wd == 6 else 5 - wd
     sat = time.gmtime(base + sat_off * 86400)
