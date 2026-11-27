@@ -80,14 +80,38 @@ FX = round((SS_SIZE[0] - 600 * FULL_SCALE) / 2)   # ≈7
 FY = round((SS_SIZE[1] - 800 * FULL_SCALE) / 2)   # ≈16
 
 
+# 画布几何:默认竖版(600x800 设计区 → 758x1024,scale 1.24)。
+# 床头屏(晨报/晚报/周末)自 2026-11-27 起横版出图:800x600 设计区 →
+# 1024x758 画布,画完旋转 -90° 存回 758x1024(Kindle 横过来放,顶边朝左、
+# 充电口朝右),Kindle 端拉图/显示代码不动。竖版仪表盘/海报(png_render)
+# 仍用竖版几何。_new_canvas(landscape=...) 切换几何;fs/fy 与全部量字
+# 函数都读当前几何,竖版行为不变。
+_LS_W, _LS_H = 1024, 758
+_LS_SCALE = min(_LS_W / 800, _LS_H / 600)  # 758/600 = 1.2633…(高受限)
+_GEOM = {"scale": FULL_SCALE, "ox": FX, "oy": FY,
+         "w": SS_SIZE[0], "h": SS_SIZE[1]}
+
+
+def _set_geometry(landscape):
+    """切换画布几何:横版 800x600 设计区(1024x758),竖版 600x800(758x1024)。"""
+    if landscape:
+        _GEOM.update(scale=_LS_SCALE,
+                     ox=round((_LS_W - 800 * _LS_SCALE) / 2),
+                     oy=round((_LS_H - 600 * _LS_SCALE) / 2),
+                     w=_LS_W, h=_LS_H)
+    else:
+        _GEOM.update(scale=FULL_SCALE, ox=FX, oy=FY,
+                     w=SS_SIZE[0], h=SS_SIZE[1])
+
+
 def fs(x):
     """设计区 x 坐标 → 画布 x 坐标(等比放大 + 居中偏移,× 超采样倍数)。"""
-    return round(x * FULL_SCALE * AA_SCALE + FX * AA_SCALE)
+    return round(x * _GEOM["scale"] * AA_SCALE + _GEOM["ox"] * AA_SCALE)
 
 
 def fy(y):
     """设计区 y 坐标 → 画布 y 坐标(等比放大 + 居中偏移,× 超采样倍数)。"""
-    return round(y * FULL_SCALE * AA_SCALE + FY * AA_SCALE)
+    return round(y * _GEOM["scale"] * AA_SCALE + _GEOM["oy"] * AA_SCALE)
 
 
 def fbox(x0, y0, x1, y1):
@@ -751,11 +775,16 @@ def _espn_barca_entry(standings):
 
 
 def get_barca():
-    """巴萨下一场 LaLiga 比赛(北京时间)+ 当前榜位积分;ESPN 公开接口。
+    """巴萨下一场 LaLiga 比赛(北京时间)+ 上一场比分 + 当前榜位积分;ESPN 公开接口。
 
     fixture=true 只返回未赛日程;取第一场(只看 LaLiga,杯赛不在列)。
+    上一场另取不带 fixture 的完整日程里最近一场已赛(带比分);取不到
+    时 last_* 保持 None,渲染只显示下一场(不崩、不编比分)。
     """
-    out = {"opponent": None, "venue": None, "when": None, "rank": None, "points": None}
+    out = {"opponent": None, "venue": None, "when": None, "next_date": None,
+           "rank": None, "points": None,
+           "last_opponent": None, "last_venue": None, "last_score": None,
+           "last_result": None, "last_when": None}
     sched = fetch_json("https://site.api.espn.com/apis/site/v2/sports/soccer/%s"
                        "/teams/%d/schedule?fixture=true" % (BARCA_LEAGUE, BARCA_TEAM_ID))
     now = time.time()
@@ -775,7 +804,40 @@ def get_barca():
                             or c["team"].get("displayName") or "?")
         out["venue"], out["opponent"] = venue, opponent
         out["when"] = time.strftime("%b %d %H:%M", time.gmtime(ts + 8 * 3600))
+        out["next_date"] = e["date"][:10]
         break
+    try:
+        sched_all = fetch_json("https://site.api.espn.com/apis/site/v2/sports/soccer/%s"
+                               "/teams/%d/schedule" % (BARCA_LEAGUE, BARCA_TEAM_ID))
+        best, best_ts = None, None
+        for e in sched_all.get("events", []):
+            try:
+                ts = calendar.timegm(time.strptime(e["date"], "%Y-%m-%dT%H:%MZ"))
+            except Exception:
+                continue
+            if ts < now and (best_ts is None or ts > best_ts):
+                best, best_ts = e, ts
+        if best is not None:
+            venue, opponent, mine, theirs = "vs", None, None, None
+            for c in best["competitions"][0]["competitors"]:
+                if c["team"].get("id") == str(BARCA_TEAM_ID):
+                    venue = "vs" if c.get("homeAway") == "home" else "@"
+                    mine = c.get("score")
+                else:
+                    opponent = (c["team"].get("shortDisplayName")
+                                or c["team"].get("displayName") or "?")
+                    theirs = c.get("score")
+            if opponent is not None:
+                out["last_opponent"], out["last_venue"] = opponent, venue
+                out["last_when"] = time.strftime(
+                    "%b %d %H:%M", time.gmtime(best_ts + 8 * 3600))
+                if mine is not None and theirs is not None:
+                    out["last_score"] = "%s-%s" % (mine, theirs)
+                    out["last_result"] = ("W" if int(mine) > int(theirs)
+                                          else "L" if int(mine) < int(theirs)
+                                          else "D")
+    except Exception:
+        pass  # 上一场取不到不影响下一场与榜位
     stand = fetch_json("https://site.api.espn.com/apis/v2/sports/soccer/%s/standings?season=%d"
                        % (BARCA_LEAGUE, _laliga_season()))
     got = _espn_barca_entry(stand)
@@ -1125,7 +1187,7 @@ def short_date(iso):
 def _fit(d, font, s, max_w, start, bold=True, min_size=14):
     """动态缩字直到宽度 <= max_w(设计区坐标)。"""
     size = start
-    while size > min_size and d.textlength(s, font=font(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+    while size > min_size and d.textlength(s, font=font(bold, size)) / (_GEOM["scale"] * AA_SCALE) > max_w:
         size -= 1
     return size
 
@@ -1133,7 +1195,7 @@ def _fit(d, font, s, max_w, start, bold=True, min_size=14):
 def _text_tracked(d, font, x, y, s, size, bold=False, fill=0, track=2, anchor="la"):
     """加字距小号大写标签;支持 la/ma/ra 三种水平锚。"""
     f = font(bold, size)
-    wd = sum(d.textlength(ch, font=f) for ch in s) / (FULL_SCALE * AA_SCALE) + track * len(s)
+    wd = sum(d.textlength(ch, font=f) for ch in s) / (_GEOM["scale"] * AA_SCALE) + track * len(s)
     if anchor[0] == "m":
         x -= wd / 2
     elif anchor[0] == "r":
@@ -1141,7 +1203,7 @@ def _text_tracked(d, font, x, y, s, size, bold=False, fill=0, track=2, anchor="l
     cx = fs(x)
     for ch in s:
         d.text((cx, fy(y)), ch, font=f, fill=fill)
-        cx += d.textlength(ch, font=f) + track * FULL_SCALE * AA_SCALE
+        cx += d.textlength(ch, font=f) + track * _GEOM["scale"] * AA_SCALE
 
 
 def _masthead(d, font, text):
@@ -1188,9 +1250,9 @@ def _dots(d, x0, x1, cy, fill=0, step=5, r=1.2):
 
 def _ellipsize(d, font, s, max_w, size, bold=False):
     """按设计区宽度截断长串(越界加 '...'),资讯盒仓库名用。"""
-    if d.textlength(s, font=font(bold, size)) / (FULL_SCALE * AA_SCALE) <= max_w:
+    if d.textlength(s, font=font(bold, size)) / (_GEOM["scale"] * AA_SCALE) <= max_w:
         return s
-    while s and d.textlength(s + "...", font=font(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+    while s and d.textlength(s + "...", font=font(bold, size)) / (_GEOM["scale"] * AA_SCALE) > max_w:
         s = s[:-1]
     return s + "..."
 
@@ -1202,8 +1264,8 @@ def _standings_rows(d, font, text, x0, x1, rows, y0, step=28):
         name, val = str(name), str(val)
         text(x0, ry, str(pos), font(True, 13), anchor="lm")
         text(x0 + 34, ry, name, font(True, 17), anchor="lm")
-        nw = d.textlength(name, font=font(True, 17)) / (FULL_SCALE * AA_SCALE)
-        pw = d.textlength(val, font=font(True, 17)) / (FULL_SCALE * AA_SCALE)
+        nw = d.textlength(name, font=font(True, 17)) / (_GEOM["scale"] * AA_SCALE)
+        pw = d.textlength(val, font=font(True, 17)) / (_GEOM["scale"] * AA_SCALE)
         _dots(d, x0 + 34 + nw + 8, x1 - 8 - pw - 8, ry)
         text(x1 - 8, ry, val, font(True, 17), anchor="rm")
         ry += step
@@ -1372,7 +1434,7 @@ def _poster_footer(d, data, font, text, nr):
             continue
         cand = "%s · %s %s" % (line, label, stale[label][1])
         w = (sum(d.textlength(ch, font=font(False, 12)) for ch in cand)
-             / (FULL_SCALE * AA_SCALE) + 1 * len(cand))
+             / (_GEOM["scale"] * AA_SCALE) + 1 * len(cand))
         if w <= 544:
             line = cand
         else:
@@ -1474,7 +1536,7 @@ def _fit_cjk(d, cjk, s, max_w, start, bold=True, min_size=12):
     if cjk(bold, start) is None:
         return start
     size = start
-    while size > min_size and d.textlength(s, font=cjk(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+    while size > min_size and d.textlength(s, font=cjk(bold, size)) / (_GEOM["scale"] * AA_SCALE) > max_w:
         size -= 1
     return size
 
@@ -1483,21 +1545,23 @@ def _cjk_ellipsize(d, cjk, s, max_w, size, bold=True):
     """中文按设计区宽度截断(越界加 '…');无 CJK 字体时原样返回。"""
     if cjk(bold, size) is None:
         return s
-    if d.textlength(s, font=cjk(bold, size)) / (FULL_SCALE * AA_SCALE) <= max_w:
+    if d.textlength(s, font=cjk(bold, size)) / (_GEOM["scale"] * AA_SCALE) <= max_w:
         return s
-    while s and d.textlength(s + "…", font=cjk(bold, size)) / (FULL_SCALE * AA_SCALE) > max_w:
+    while s and d.textlength(s + "…", font=cjk(bold, size)) / (_GEOM["scale"] * AA_SCALE) > max_w:
         s = s[:-1]
     return s + "…"
 
 
-def _new_canvas():
+def _new_canvas(landscape=False):
     """超采样画布 + 字体闭包(font/text 沿用旧逻辑,新增 cjk/ctext 画中文)。
 
     返回 (img, d, font, text, cjk, ctext)。ctext 用 Noto Sans CJK SC
     画整串(含串里的拉丁/数字/°C,中文字体自带这些字形);无 CJK 字体时
     退回 Barlow(中文缺字,仅作兜底不崩溃)。
+    landscape=True 时切横版几何(800x600 设计区,1024x758 画布)。
     """
-    img = Image.new("L", (SS_SIZE[0] * AA_SCALE, SS_SIZE[1] * AA_SCALE), 255)
+    _set_geometry(landscape)
+    img = Image.new("L", (_GEOM["w"] * AA_SCALE, _GEOM["h"] * AA_SCALE), 255)
     d = ImageDraw.Draw(img)
 
     def font(bold, size):
@@ -1505,7 +1569,7 @@ def _new_canvas():
         # 字号按 FULL_SCALE × AA_SCALE 放大到超采样画布,保证缩回后铺满 758×1024
         for path in _font_candidates(bold):
             try:
-                f = ImageFont.truetype(path, max(1, round(size * FULL_SCALE * AA_SCALE)))
+                f = ImageFont.truetype(path, max(1, round(size * _GEOM["scale"] * AA_SCALE)))
             except Exception:
                 continue
             if os.path.basename(path) == "Jost.ttf":
@@ -1521,7 +1585,7 @@ def _new_canvas():
         for path in _cjk_candidates(bold):
             try:
                 # TTC 里简体中文面 index=2(JP 0 / KR 1 / SC 2 / TC 3 / HK 4)
-                return ImageFont.truetype(path, max(1, round(size * FULL_SCALE * AA_SCALE)),
+                return ImageFont.truetype(path, max(1, round(size * _GEOM["scale"] * AA_SCALE)),
                                          index=2)
             except Exception:
                 continue
@@ -1540,9 +1604,15 @@ def _new_canvas():
     return img, d, font, text, cjk, ctext
 
 
-def _finish_canvas(img, out):
-    """超采样缩回 + 两端钳位 + 落盘(与旧 png_render 完全一致的输出处理)。"""
-    img = img.resize(SS_SIZE, Image.LANCZOS)
+def _finish_canvas(img, out, landscape=False):
+    """超采样缩回 + 两端钳位 + 落盘(与旧 png_render 完全一致的输出处理)。
+
+    landscape=True 时先把 1024x758 横版图旋转 -90°(顺时针)存回
+    758x1024:文件仍是 Kindle 的竖版尺寸,横过来放(顶边朝左)即正。
+    """
+    img = img.resize((_GEOM["w"], _GEOM["h"]), Image.LANCZOS)
+    if landscape:
+        img = img.rotate(-90, expand=True)
     # 两端钳位:硬阈值(全拍纯黑白)把 AA 边缘像素也拍成锯齿,实测字体锯齿过重;
     # 改为笔画芯(<64)拍纯黑防发虚、背景(>160)拍纯白,64-160 的 1px AA 过渡带
     # 保留中深灰阶 —— 深灰在 e-ink 量化稳定(发虚的是 180-240 浅灰,已被排除),
@@ -1580,8 +1650,9 @@ def png_render(data, out=SS_OUT):
 
 
 # ---------------- 床头屏渲染(晨报 / 晚报 / 周末,设计稿 v2 无日程) ----------------
-# 全部在 600x800 设计区画,fs/fy 与旧版式同一套坐标;状态栏右侧留空,
-# Kindle 端 overlay_battery 会在那里叠加电量角标(云端不知道电量)。
+# 自 2026-11-27 起横版:800x600 设计区画,出图后旋转 -90° 存 758x1024
+# (Kindle 横过来放,顶边朝左)。状态栏右侧留空,Kindle 端 overlay_battery
+# 会在那里叠加电量角标(云端不知道电量)。
 
 def _bj_date_cn(now_bj):
     """北京时间 struct_time → '11月23日 星期一'。"""
@@ -1625,57 +1696,67 @@ def _weather_day(data, date_str):
     return None
 
 
-def _brief_header(d, font, text, ctext, cjk, now_bj, title_en, upd_hhmm):
-    """床头屏页眉:左中文日期、右英文标题、第二行城市 + 更新时间,下划线。"""
-    ctext(28, 22, _bj_date_cn(now_bj), 20, bold=True)
-    text(572, 24, title_en, font(True, 15), anchor="ra")
-    text(28, 52, "HANGZHOU", font(False, 11))
-    ctext(572, 52, "更新 %s" % upd_hhmm, 11, anchor="ra")
-    d.line([fs(28), fy(78), fs(572), fy(78)], fill=0, width=lw(2))
+def _brief_header(d, font, text, ctext, cjk, now_bj, title_en, upd_hhmm,
+                  x0=28, x1=572, date_size=20, title_size=15, city_size=11,
+                  small_size=11, div_y=78):
+    """床头屏页眉:左中文日期、右英文标题、第二行城市 + 更新时间,下划线。
+
+    默认竖版坐标;横版传 x0=22、x1=778 与更大的字号。
+    """
+    ctext(x0, 22, _bj_date_cn(now_bj), date_size, bold=True)
+    text(x1, 24, title_en, font(True, title_size), anchor="ra")
+    text(x0, 52, "HANGZHOU", font(False, city_size))
+    ctext(x1, 52, "更新 %s" % upd_hhmm, small_size, anchor="ra")
+    d.line([fs(x0), fy(div_y), fs(x1), fy(div_y)], fill=0, width=lw(2))
 
 
-def _status_bar(d, font, text, label):
+def _status_bar(d, font, text, label, x0=28, x1=572, y=758, size=11):
     """状态栏:分隔线 + 左侧小字(模板名·更新时间);右侧留空给电量角标。"""
-    d.line([fs(28), fy(758), fs(572), fy(758)], fill=0, width=lw(2))
-    text(28, 766, label, font(False, 11))
+    d.line([fs(x0), fy(y), fs(x1), fy(y)], fill=0, width=lw(2))
+    text(x0, y + 8, label, font(False, size))
 
 
-def _black_bar(d, ctext, cjk, y, s, h=44):
+def _black_bar(d, ctext, cjk, y, s, h=44, x0=28, x1=572, size=16):
     """通勤黑条(反色):黑底白字,中文按宽缩字,居中。"""
-    d.rectangle([fs(28), fy(y), fs(572) - 1, fy(y + h) - 1], fill=0)
-    size = _fit_cjk(d, cjk, s, 544 - 24, 16)
-    ctext(300, y + h / 2, s, size, bold=True, fill=255, anchor="mm")
+    d.rectangle([fs(x0), fy(y), fs(x1) - 1, fy(y + h) - 1], fill=0)
+    size = _fit_cjk(d, cjk, s, (x1 - x0) - 24, size)
+    ctext((x0 + x1) / 2, y + h / 2, s, size, bold=True, fill=255, anchor="mm")
 
 
-def _brief_box(d, font, ctext, cjk, x0, x1, title, lines, y0, y1):
+def _brief_box(d, font, ctext, cjk, x0, x1, title, lines, y0, y1,
+               title_size=14, line_size=12, line_step=22):
     """床头屏小盒:中文标题居中 + 下划线 + '- ' 行列(限 3 行,超长截断)。"""
     cx = (x0 + x1) / 2
     d.rectangle([fs(x0), fy(y0), fs(x1) - 1, fy(y1) - 1], outline=0, width=lw(2))
-    ctext(cx, y0 + 10, title, 14, bold=True, anchor="ma")
-    d.line([fs(x0 + 14), fy(y0 + 28), fs(x1 - 14), fy(y0 + 28)], fill=0, width=lw(2))
-    ly = y0 + 42
+    ctext(cx, y0 + 8, title, title_size, bold=True, anchor="ma")
+    d.line([fs(x0 + 14), fy(y0 + 12 + title_size + 4), fs(x1 - 14),
+            fy(y0 + 12 + title_size + 4)], fill=0, width=lw(2))
+    ly = y0 + 12 + title_size + 14
     for s in (lines or ["—"])[:3]:
-        line = _cjk_ellipsize(d, cjk, "- %s" % s, x1 - x0 - 24, 12, bold=True)
-        ctext(x0 + 12, ly, line, 12, bold=True)
-        ly += 22
+        line = _cjk_ellipsize(d, cjk, "- %s" % s, x1 - x0 - 24, line_size, bold=True)
+        ctext(x0 + 12, ly, line, line_size, bold=True)
+        ly += line_step
 
 
-def _headline_rows(d, font, text, ctext, cjk, items, y0, step, size=17):
+def _headline_rows(d, font, text, ctext, cjk, items, y0, step, size=17,
+                   x0=28, width=514):
     """头条行列:序号(Barlow 加粗)+ 中文一行,超宽截断;返回末行 y。"""
     y = y0
     for i, s in enumerate(items):
-        text(28, y, "%d." % (i + 1), font(True, size))
-        line = _cjk_ellipsize(d, cjk, s, 544 - 30, size, bold=True)
-        ctext(58, y, line, size, bold=True)
+        text(x0, y, "%d." % (i + 1), font(True, size))
+        line = _cjk_ellipsize(d, cjk, s, width - 30, size, bold=True)
+        ctext(x0 + 30, y, line, size, bold=True)
         y += step
     return y
 
 
-def _section_title(d, font, text, ctext, y, title_cn, title_en):
-    """区块标题:中文 18 加粗 + 英文 13,下划线在 y+28。"""
-    ctext(28, y, title_cn, 18, bold=True)
-    text(28 + 4 + len(title_cn) * 20, y + 4, title_en, font(False, 13))
-    d.line([fs(28), fy(y + 28), fs(572), fy(y + 28)], fill=0, width=lw(2))
+def _section_title(d, font, text, ctext, y, title_cn, title_en,
+                   x0=28, x1=572, title_size=18, en_size=13):
+    """区块标题:中文加粗 + 英文,下划线在 y+28。"""
+    ctext(x0, y, title_cn, title_size, bold=True)
+    text(x0 + 4 + len(title_cn) * (title_size + 2), y + 4, title_en,
+         font(False, en_size))
+    d.line([fs(x0), fy(y + 28), fs(x1), fy(y + 28)], fill=0, width=lw(2))
 
 
 def _weather_lines(day):
@@ -1791,29 +1872,121 @@ def _draw_weather_icon(d, x0, y0, x1, y1, code):
                    (fs(cx + s * 0.03), fy(cy + s * 0.30))], fill=0)
 
 
+# 大奖赛举办地 → 中文(上场/下场行用;未收录的站名原样显示英文)。
+_GP_CN = {"Qatar": "卡塔尔", "Abu Dhabi": "阿布扎比", "Las Vegas": "拉斯维加斯",
+          "Bahrain": "巴林", "Saudi Arabia": "沙特", "Australia": "澳大利亚",
+          "Japan": "日本", "China": "中国", "Miami": "迈阿密",
+          "Emilia Romagna": "伊莫拉", "Monaco": "摩纳哥", "Spain": "西班牙",
+          "Canada": "加拿大", "Austria": "奥地利", "Great Britain": "英国",
+          "Belgium": "比利时", "Hungary": "匈牙利", "Netherlands": "荷兰",
+          "Italy": "意大利", "Azerbaijan": "阿塞拜疆", "Singapore": "新加坡",
+          "Mexico": "墨西哥", "Brazil": "巴西", "United States": "美国"}
+_MONTH_CN = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+             "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+
+
+def _gp_place_cn(race):
+    """'Qatar Grand Prix' → '卡塔尔';未收录站名返回英文地名。"""
+    if not race:
+        return None
+    place, _ = split_race_name(race)
+    # split_race_name 返回大写地名,按首字母大写还原后查表
+    place = place.title()
+    return _GP_CN.get(place, place)
+
+
+def _cn_date(iso):
+    """'2026-11-29' → '11月29日';解析失败原样返回。"""
+    try:
+        t = time.strptime(iso, "%Y-%m-%d")
+        return "%d月%d日" % (t.tm_mon, t.tm_mday)
+    except Exception:
+        return iso
+
+
+def _cn_when(when):
+    """巴萨 when 'Nov 29 23:15' → '11月29日';解析失败原样返回。"""
+    try:
+        mon, day, _hhmm = str(when).split()
+        return "%d月%d日" % (_MONTH_CN[mon], int(day))
+    except Exception:
+        return when
+
+
+def _f1_box_lines(data):
+    """F1 小盒:上场冠军 + 下一场;缺上场只显示下一场,都没数据留占位。"""
+    lines = []
+    lr = data.get("last_race")
+    res = data.get("last_results") or []
+    if res:
+        # 姓用原大小写(Verstappen);surname() 全大写是计时塔语法,不适合中文行
+        lines.append("上场 %s 夺冠" % res[0][1].split()[-1])
+    elif lr is not None:
+        lines.append("上场 %s" % (_gp_place_cn(lr) or lr.get("raceName", "")))
+    nr = data.get("next_race")
+    if nr is not None:
+        lines.append("下场 %s %s" % (_gp_place_cn(nr),
+                                     _cn_date(nr.get("date", ""))))
+    return lines or ["F1 数据暂无更新"]
+
+
+def _barca_last_line(b):
+    """巴萨上一场:'上场 3-2 胜 Villarreal';缺比分只显示对手。"""
+    if not b.get("last_opponent"):
+        return None
+    score = b.get("last_score")
+    if not score:
+        return "上场 vs %s" % b["last_opponent"]
+    verb = {"W": "胜", "D": "平", "L": "负"}.get(b.get("last_result"), "vs")
+    return "上场 %s %s %s" % (score, verb, b["last_opponent"])
+
+
+def _barca_box_lines(data):
+    """巴萨小盒:上场比分 + 下一场 + 联赛榜位;缺上场只显示下场与榜位。"""
+    b = data.get("barca") or {}
+    lines = []
+    last = _barca_last_line(b)
+    if last:
+        lines.append(last)
+    if b.get("opponent"):
+        # 批准版式写 "vs Deportivo"(主客场不进小盒,周末屏比赛行保留 venue)
+        when = (_cn_date(b["next_date"]) if b.get("next_date")
+                else _cn_when(b.get("when")))
+        lines.append("下场 vs %s %s" % (b["opponent"], when or ""))
+    if b.get("rank") and b.get("points") is not None:
+        rank = re.sub(r"(st|nd|rd|th)$", "", str(b["rank"]))
+        lines.append("联赛第%s • %d 分" % (rank, b["points"]))
+    return lines or ["巴萨数据暂无更新"]
+
+
 def _draw_morning(d, data, font, text, cjk, ctext):
-    """晨报屏 v2(设计稿 §2):页眉 70 / 天气 266 / 头条 297 / 底部三联 117 / 状态栏 34。"""
+    """晨报屏 v3 横版(2026-11-27 Ken 批准,设计区 800x600):
+    页眉 / 左天气(大字温差 + 大图标 + 天气词 + 降雨/湿度/穿衣/明日 + 通勤黑条)
+    / 右头条 5 条 / 底部三联(F1 上场+下场 / 巴萨上场+下场+榜位 / 模拟盘)。
+    天气图标 box 170x150(竖版是 160x100),出图后旋转 -90° 存 758x1024。
+    """
     now_bj = data.get("now_bj") or _beijing_now()
     upd = data.get("upd", "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min))
-    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
-    _brief_header(d, font, text, ctext, cjk, now_bj, "MORNING BRIEFING", upd)
+    d.rectangle([fs(8), fy(8), fs(792) - 1, fy(592) - 1], outline=0, width=lw(2))
+    _brief_header(d, font, text, ctext, cjk, now_bj, "MORNING BRIEFING", upd,
+                  x0=22, x1=778, date_size=24, title_size=21, city_size=16,
+                  small_size=14, div_y=73)
 
-    # 天气 78–344:左大字温差 + 降雨/湿度行,右大图标 + 天气词(远看先认图标)
+    # 左天气 73–456:温度在上、图标在下居中(图标不与温度重叠)
     w = data.get("weather") or {}
     today, tomorrow = w.get("today"), w.get("tomorrow")
     if today:
-        text(28, 92, "%d°–%d°" % (today["low"], today["high"]), font(True, 46))
-        _draw_weather_icon(d, 400, 80, 560, 180, today.get("code"))
-        ctext(480, 182, _wx_cn(today), 22, bold=True, anchor="ma")
+        text(22, 85, "%d°–%d°" % (today["low"], today["high"]), font(True, 51))
+        _draw_weather_icon(d, 145, 125, 315, 275, today.get("code"))
+        ctext(230, 268, _wx_cn(today), 25, bold=True, anchor="ma")
         for i, line in enumerate(_weather_lines(today)):
-            ctext(28, 152 + i * 26, line, 15)
+            ctext(22, 308 + i * 26, line, 17)
         tip = _clothing_tip(today)
         if tip:
-            ctext(28, 200, tip, 15, bold=True)
+            ctext(22, 360, tip, 17, bold=True)
     else:
-        ctext(28, 92, "天气暂无数据", 16, bold=True)
+        ctext(22, 85, "天气暂无数据", 17, bold=True)
     if tomorrow:
-        # 旧缓存(7 天预报之前)的 tomorrow 没有 date 字段:缺了只不显示日期
         tdate = tomorrow.get("date")
         if tdate:
             label = "明日 %d月%d日 %d°–%d° %s" % (
@@ -1822,37 +1995,25 @@ def _draw_morning(d, data, font, text, cjk, ctext):
         else:
             label = "明日 %d°–%d° %s" % (
                 tomorrow["low"], tomorrow["high"], _wx_cn(tomorrow))
-        ctext(28, 230, label, 15)
-    _black_bar(d, ctext, cjk, 286, _commute_line(today))
+        ctext(22, 386, label, 17)
+    _black_bar(d, ctext, cjk, 408, _commute_line(today), h=34,
+               x0=22, x1=372, size=17)
+    d.line([fs(390), fy(85), fs(390), fy(442)], fill=0, width=lw(2))
 
-    # 头条 344–641:5 条 Muse 生成,过期/缺失只显示无数据
-    _section_title(d, font, text, ctext, 360, "头条", "HEADLINES")
+    # 右头条 73–442:5 条 Muse 生成,过期/缺失只显示无数据
+    _section_title(d, font, text, ctext, 85, "头条", "HEADLINES",
+                   x0=407, x1=778, title_size=24, en_size=17)
     hl = data.get("headlines") or {}
     items = hl.get("morning") if hl.get("fresh_morning") else []
     if items:
-        _headline_rows(d, font, text, ctext, cjk, items[:5], 404, 48)
+        _headline_rows(d, font, text, ctext, cjk, items[:5], 139, 60,
+                       size=21, x0=407, width=371)
     else:
-        ctext(28, 404, "头条暂无更新", 16, bold=True)
-        text(28, 440, "HEADLINES NOT UPDATED YET", font(False, 12))
+        ctext(407, 139, "头条暂无更新", 17, bold=True)
+        text(407, 175, "HEADLINES NOT UPDATED YET", font(False, 12))
 
-    # 底部三联 641–758:F1 下一场 / 巴萨 / 模拟盘(钱数只读 briefing.json)
+    # 底部三联 458–566:F1 / 巴萨(上场+下场)/ 模拟盘(钱数只读 briefing.json)
     br = data.get("briefing") or {}
-    nr = data.get("next_race")
-    f1_lines = []
-    if nr is not None:
-        f1_lines.append(nr["raceName"])
-        f1_lines.append("%s %s" % (short_date(nr["date"]),
-                                   format_race_daytime(nr) or "TBD"))
-    if not f1_lines:
-        f1_lines = ["F1 数据暂无更新"]
-    b = data.get("barca") or {}
-    barca_lines = []
-    if b.get("opponent"):
-        barca_lines.append("%s %s" % (b["venue"] or "vs", b["opponent"]))
-    if b.get("when"):
-        barca_lines.append(b["when"])
-    if b.get("rank"):
-        barca_lines.append("LaLiga %s · %d 分" % (b["rank"], b["points"]))
     pm = br.get("polymarket") or {}
     pm_lines = []
     if pm.get("cash"):
@@ -1861,48 +2022,58 @@ def _draw_morning(d, data, font, text, cjk, ctext):
         pm_lines.append("本周 %s" % pm["pnl"])
     if not pm_lines:
         pm_lines = ["模拟盘数据待接入"]
-    _brief_box(d, font, ctext, cjk, 28, 206, "F1 下一场", f1_lines, 648, 752)
-    _brief_box(d, font, ctext, cjk, 218, 392, "巴萨", barca_lines, 648, 752)
-    _brief_box(d, font, ctext, cjk, 404, 572, "模拟盘", pm_lines, 648, 752)
+    _brief_box(d, font, ctext, cjk, 22, 259, "F1", _f1_box_lines(data),
+               458, 566, title_size=19, line_size=15, line_step=19)
+    _brief_box(d, font, ctext, cjk, 277, 514, "巴萨", _barca_box_lines(data),
+               458, 566, title_size=19, line_size=15, line_step=19)
+    _brief_box(d, font, ctext, cjk, 532, 769, "模拟盘", pm_lines,
+               458, 566, title_size=19, line_size=15, line_step=19)
 
-    _status_bar(d, font, text, "MORNING BRIEFING · %s" % upd)
+    _status_bar(d, font, text, "MORNING BRIEFING · %s" % upd,
+                x0=22, x1=778, y=572, size=10)
 
 
 def _draw_evening(d, data, font, text, cjk, ctext):
-    """晚报屏 v2(设计稿 §3):页眉 70 / 明日天气 250 / 今日收盘 188 / 头条回顾 219 / 今晚一行 39 / 状态栏 34。"""
+    """晚报屏 v3 横版(2026-11-27):页眉 / 左明日天气(大图标) / 右今日收盘 +
+    头条回顾 / 底部今晚一行黑条 / 状态栏。"""
     now_bj = data.get("now_bj") or _beijing_now()
     upd = data.get("upd", "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min))
-    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
-    _brief_header(d, font, text, ctext, cjk, now_bj, "EVENING BRIEFING", upd)
+    d.rectangle([fs(8), fy(8), fs(792) - 1, fy(592) - 1], outline=0, width=lw(2))
+    _brief_header(d, font, text, ctext, cjk, now_bj, "EVENING BRIEFING", upd,
+                  x0=22, x1=778, date_size=24, title_size=21, city_size=16,
+                  small_size=14, div_y=73)
 
-    # 明日天气 78–328:左大字 + 降雨/湿度行,右大图标 + 天气词(与晨报同版式)
+    # 左明日天气 73–430:与晨报同版式(温度在上、图标在下居中)
     w = data.get("weather") or {}
     tomorrow = w.get("tomorrow")
     days = w.get("days") or []
     day_after = days[2] if len(days) > 2 else None
     if tomorrow:
-        text(28, 92, "%d°–%d°" % (tomorrow["low"], tomorrow["high"]), font(True, 46))
-        _draw_weather_icon(d, 400, 80, 560, 180, tomorrow.get("code"))
-        ctext(480, 182, _wx_cn(tomorrow), 22, bold=True, anchor="ma")
+        text(22, 85, "%d°–%d°" % (tomorrow["low"], tomorrow["high"]), font(True, 51))
+        _draw_weather_icon(d, 145, 125, 315, 275, tomorrow.get("code"))
+        ctext(230, 268, _wx_cn(tomorrow), 25, bold=True, anchor="ma")
         for i, line in enumerate(_weather_lines(tomorrow)):
-            ctext(28, 152 + i * 26, line, 15)
+            ctext(22, 308 + i * 26, line, 17)
     else:
-        ctext(28, 92, "明日天气暂无数据", 16, bold=True)
+        ctext(22, 85, "明日天气暂无数据", 17, bold=True)
     if day_after:
         adate = day_after.get("date")
         if adate:
-            label = "后天 %d月%d日 %d°–%d° %s，更冷注意保暖" % (
+            label = "后天 %d月%d日 %d°–%d° %s" % (
                 int(adate[5:7]), int(adate[8:10]),
                 day_after["low"], day_after["high"], _wx_cn(day_after))
         else:
-            label = "后天 %d°–%d° %s，更冷注意保暖" % (
+            label = "后天 %d°–%d° %s" % (
                 day_after["low"], day_after["high"], _wx_cn(day_after))
-        ctext(28, 200, label, 15)
-    _black_bar(d, ctext, cjk, 270,
-               "明早" + _commute_line(tomorrow).replace("早上", "", 1))
+        ctext(22, 360, label, 17)
+    _black_bar(d, ctext, cjk, 396,
+               "明早" + _commute_line(tomorrow).replace("早上", "", 1),
+               h=34, x0=22, x1=372, size=15)
+    d.line([fs(390), fy(85), fs(390), fy(430)], fill=0, width=lw(2))
 
-    # 今日收盘 328–516:只读 briefing.json,缺了留 TODO 占位,不写死钱数
-    _section_title(d, font, text, ctext, 344, "今日收盘", "MARKET CLOSE")
+    # 右今日收盘 73–250:只读 briefing.json,缺了留 TODO 占位,不写死钱数
+    _section_title(d, font, text, ctext, 85, "今日收盘", "MARKET CLOSE",
+                   x0=407, x1=778, title_size=24, en_size=17)
     br = data.get("briefing") or {}
     close = br.get("close") or {}
     lines = []
@@ -1921,13 +2092,14 @@ def _draw_evening(d, data, font, text, cjk, ctext):
         lines.append("巴萨今晚 %s %s" % (b["when"], b["opponent"]))
     if not lines:
         lines = ["收盘数据待接入", "CLOSE DATA NOT AVAILABLE"]
-    y = 388
+    y = 139
     for s in lines[:4]:
-        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
+        ctext(407, y, _cjk_ellipsize(d, cjk, s, 371, 17, bold=True), 17, bold=True)
         y += 30
 
-    # 头条回顾 516–735:晚报 4 条;没有就用晨报前 4 条;都没有显示无数据
-    _section_title(d, font, text, ctext, 532, "头条回顾", "RECAP")
+    # 右头条回顾 268–478:晚报 4 条;没有就用晨报前 4 条;都没有显示无数据
+    _section_title(d, font, text, ctext, 268, "头条回顾", "RECAP",
+                   x0=407, x1=778, title_size=24, en_size=17)
     hl = data.get("headlines") or {}
     if hl.get("fresh_evening"):
         items = hl.get("evening") or []
@@ -1936,11 +2108,12 @@ def _draw_evening(d, data, font, text, cjk, ctext):
     else:
         items = []
     if items:
-        _headline_rows(d, font, text, ctext, cjk, items[:4], 576, 38, size=16)
+        _headline_rows(d, font, text, ctext, cjk, items[:4], 312, 46,
+                       size=18, x0=407, width=371)
     else:
-        ctext(28, 576, "头条回顾暂无更新", 16, bold=True)
+        ctext(407, 312, "头条回顾暂无更新", 17, bold=True)
 
-    # 今晚一行 735–758
+    # 今晚一行 500–536:全宽黑条
     tonight = br.get("tonight")
     if not tonight:
         nr = data.get("next_race")
@@ -1948,10 +2121,10 @@ def _draw_evening(d, data, font, text, cjk, ctext):
             nr["raceName"] if nr else "—",
             b.get("when", ""), b.get("opponent", "")) if nr or b.get("opponent") else None
     if tonight:
-        ctext(28, 730, _cjk_ellipsize(d, cjk, tonight, 544, 14, bold=True),
-              14, bold=True)
+        _black_bar(d, ctext, cjk, 500, tonight, h=36, x0=22, x1=778, size=15)
 
-    _status_bar(d, font, text, "EVENING BRIEFING · %s" % upd)
+    _status_bar(d, font, text, "EVENING BRIEFING · %s" % upd,
+                x0=22, x1=778, y=566, size=11)
 
 
 def _weekend_dates(now_bj):
@@ -1975,40 +2148,46 @@ def _weekend_dates(now_bj):
 
 
 def _draw_weekend(d, data, font, text, cjk, ctext):
-    """周末屏 v2(设计稿 §4):页眉 70 / 两天天气 210 / 本周回顾 170 / 周末比赛 150 / 下周一预告 150 / 状态栏 34。"""
+    """周末屏 v3 横版(2026-11-27):页眉 / 周六周日两天天气并排 / 本周回顾 /
+    周末比赛 + 下周一预告并排 / 状态栏。内容与竖版 v2 相同,只重排版式。"""
     now_bj = data.get("now_bj") or _beijing_now()
     upd = data.get("upd", "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min))
-    d.rectangle([fs(8), fy(8), fs(592) - 1, fy(792) - 1], outline=0, width=lw(2))
-    _brief_header(d, font, text, ctext, cjk, now_bj, "WEEKEND", upd)
+    d.rectangle([fs(8), fy(8), fs(792) - 1, fy(592) - 1], outline=0, width=lw(2))
+    _brief_header(d, font, text, ctext, cjk, now_bj, "WEEKEND", upd,
+                  x0=22, x1=778, date_size=24, title_size=21, city_size=16,
+                  small_size=14, div_y=73)
 
     sat, sun, mon = _weekend_dates(now_bj)
 
     def _day_box(x0, x1, day_gmt, label_cn):
         date_str = time.strftime("%Y-%m-%d", day_gmt)
         day = _weather_day(data, date_str)
-        d.rectangle([fs(x0), fy(92), fs(x1) - 1, fy(278) - 1], outline=0, width=lw(2))
-        ctext((x0 + x1) / 2, 102, "%s %d月%d日" % (label_cn, day_gmt.tm_mon, day_gmt.tm_mday),
-              16, bold=True, anchor="ma")
+        cx = (x0 + x1) / 2
+        d.rectangle([fs(x0), fy(84), fs(x1) - 1, fy(270) - 1], outline=0, width=lw(2))
+        ctext(cx, 92, "%s %d月%d日" % (label_cn, day_gmt.tm_mon, day_gmt.tm_mday),
+              17, bold=True, anchor="ma")
         if not day:
-            ctext((x0 + x1) / 2, 150, "天气暂无数据", 14, anchor="ma")
+            ctext(cx, 150, "天气暂无数据", 14, anchor="ma")
             return
-        text((x0 + x1) / 2, 132, "%d°–%d°" % (day["low"], day["high"]),
+        text(x0 + 120, 122, "%d°–%d°" % (day["low"], day["high"]),
              font(True, 30), anchor="ma")
-        ctext((x0 + x1) / 2, 172, _wx_cn(day), 15, bold=True, anchor="ma")
-        ctext((x0 + x1) / 2, 198, "降雨 %d%%" % day["pop"], 13, anchor="ma")
+        _draw_weather_icon(d, x0 + 190, 112, x0 + 310, 192, day.get("code"))
+        ctext(x0 + 250, 198, _wx_cn(day), 15, bold=True, anchor="ma")
         sun_line = " · ".join([x for x in (
+            ("降雨 %d%%" % day["pop"]),
             ("日出 %s" % day["sunrise"]) if day.get("sunrise") else None,
             ("日落 %s" % day["sunset"]) if day.get("sunset") else None) if x])
         if sun_line:
-            ctext((x0 + x1) / 2, 220, sun_line, 13, anchor="ma")
+            ctext(cx, 222, sun_line, 13, anchor="ma")
         if day["pop"] <= 20 and day.get("code") in (0, 1, 2, 3):
-            ctext((x0 + x1) / 2, 244, "适合外出", 13, bold=True, anchor="ma")
+            ctext(cx, 244, "适合外出", 13, bold=True, anchor="ma")
 
-    _day_box(28, 292, sat, "周六")
-    _day_box(308, 572, sun, "周日")
+    _day_box(22, 390, sat, "周六")
+    _day_box(410, 778, sun, "周日")
 
-    # 本周回顾 288–458:只读 briefing.json 的 weekly,缺了留 TODO 占位
-    _section_title(d, font, text, ctext, 304, "本周回顾", "WEEKLY REVIEW")
+    # 本周回顾 288–392:只读 briefing.json 的 weekly,缺了留 TODO 占位
+    _section_title(d, font, text, ctext, 288, "本周回顾", "WEEKLY REVIEW",
+                   x0=22, x1=778)
     br = data.get("briefing") or {}
     wk = br.get("weekly") or {}
     lines = []
@@ -2023,30 +2202,38 @@ def _draw_weekend(d, data, font, text, cjk, ctext):
         lines.append("模拟盘本周 %s" % pm["pnl"])
     if not lines:
         lines = ["本周回顾待接入", "WEEKLY REVIEW NOT AVAILABLE"]
-    y = 348
+    y = 324
     for s in lines[:3]:
-        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
-        y += 30
+        ctext(22, y, _cjk_ellipsize(d, cjk, s, 756, 15, bold=True), 15, bold=True)
+        y += 26
 
-    # 周末比赛 458–608:F1 下一场 + 巴萨 + Trending 第一
-    _section_title(d, font, text, ctext, 474, "周末比赛", "MATCHES & RACES")
+    # 周末比赛 + 下周一预告并排 404–550:上场/下场都显示
+    _section_title(d, font, text, ctext, 404, "周末比赛", "MATCHES & RACES",
+                   x0=22, x1=390)
+    _section_title(d, font, text, ctext, 404, "下周一预告", "MONDAY PREVIEW",
+                   x0=410, x1=778)
     nr = data.get("next_race")
     b = data.get("barca") or {}
     t = data.get("trending") or {}
     mlines = []
-    if nr is not None:
-        mlines.append("F1 下一场 %s %s" % (nr["raceName"], short_date(nr["date"])))
+    f1l = _f1_box_lines(data)
+    if f1l != ["F1 数据暂无更新"]:
+        mlines.extend("F1 %s" % s for s in f1l)
+    blast = _barca_last_line(b)
+    if blast:
+        mlines.append("巴萨" + blast)
     if b.get("opponent"):
-        mlines.append("巴萨 %s %s %s" % (b["venue"] or "vs", b["opponent"], b["when"] or ""))
+        when = (_cn_date(b["next_date"]) if b.get("next_date")
+                else _cn_when(b.get("when")))
+        mlines.append("巴萨下场 %s %s %s" % (b.get("venue") or "vs",
+                                            b["opponent"], when or ""))
     if t.get("repo"):
         mlines.append("Trending #1 %s" % t["repo"])
-    y = 518
-    for s in mlines[:3]:
-        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
-        y += 28
+    y = 440
+    for s in mlines[:5]:
+        ctext(22, y, _cjk_ellipsize(d, cjk, s, 368, 14, bold=True), 14, bold=True)
+        y += 24
 
-    # 下周一预告 608–758:周一天气 + 通勤 + 开盘确认(briefing 的 grid_note)
-    _section_title(d, font, text, ctext, 624, "下周一预告", "MONDAY PREVIEW")
     mon_str = time.strftime("%Y-%m-%d", mon)
     mday = _weather_day(data, mon_str)
     mlines = []
@@ -2060,12 +2247,13 @@ def _draw_weekend(d, data, font, text, cjk, ctext):
     elif close.get("510500"):
         c5105 = close["510500"]
         mlines.append("周一开盘确认中证500：收 %s" % c5105.get("price", ""))
-    y = 668
-    for s in mlines[:3]:
-        ctext(28, y, _cjk_ellipsize(d, cjk, s, 544, 15, bold=True), 15, bold=True)
-        y += 28
+    y = 440
+    for s in mlines[:5]:
+        ctext(410, y, _cjk_ellipsize(d, cjk, s, 368, 14, bold=True), 14, bold=True)
+        y += 24
 
-    _status_bar(d, font, text, "WEEKEND · %s" % upd)
+    _status_bar(d, font, text, "WEEKEND · %s" % upd,
+                x0=22, x1=778, y=566, size=11)
 
 
 def png_render_briefing(data, out=SS_OUT):
@@ -2077,7 +2265,10 @@ def png_render_briefing(data, out=SS_OUT):
         print("fetch failed; keeping previous screensaver:", repr(data["err"])[:80])
         return False
     template = data.get("template") or "dashboard"
-    img, d, font, text, cjk, ctext = _new_canvas()
+    # 床头屏(晨报/晚报/周末)横版出图:800x600 设计区,旋转 -90° 存 758x1024
+    # (Kindle 横过来放);竖版仪表盘/海报仍走竖版几何。
+    is_landscape = template in ("morning", "evening", "weekend")
+    img, d, font, text, cjk, ctext = _new_canvas(landscape=is_landscape)
     if template == "morning":
         _draw_morning(d, data, font, text, cjk, ctext)
     elif template == "evening":
@@ -2089,7 +2280,7 @@ def png_render_briefing(data, out=SS_OUT):
             _draw_poster(d, data, font, text)
         else:
             _draw_dashboard(d, data, font, text)
-    return _finish_canvas(img, out)
+    return _finish_canvas(img, out, landscape=is_landscape)
 
 
 # ---------------- 守护进程(service) ----------------
@@ -4270,8 +4461,12 @@ def mock_data(err=False, poster=False):
             "city": "HANGZHOU",
             "today": {"high": 21, "low": 16, "text": "Showers", "pop": 100},
             "tomorrow": {"high": 20, "low": 15, "text": "Drizzle", "pop": 18}},
-        "barca": None if err else {"opponent": "Villarreal", "venue": "vs",
-                                   "when": "Nov 22 21:00", "rank": "1st", "points": 33},
+        "barca": None if err else {"opponent": "Deportivo", "venue": "@",
+                                   "when": "Nov 29 23:15", "next_date": "2026-11-29",
+                                   "rank": "1st", "points": 36,
+                                   "last_opponent": "Villarreal", "last_venue": "vs",
+                                   "last_score": "3-2", "last_result": "W",
+                                   "last_when": "Nov 22 21:00"},
         "trending": None if err else {"repo": "alibaba/open-code-review",
                                       "stars_today": "1,925", "lang": "TypeScript",
                                       "stars_total": "50,985"},
@@ -4326,6 +4521,31 @@ def mock_briefing_data(template="morning"):
         now_bj = _beijing_now(_bj_epoch(2026, 11, 28, 9, 0))
     data["weather"] = {"city": "HANGZHOU", "today": today,
                        "tomorrow": tomorrow, "days": days}
+    # 批准版式里的赛果(2026-11-27 实况):上场拉斯维加斯 Verstappen 夺冠,
+    # 下场卡塔尔 11 月 29 日;巴萨上场 3-2 胜 Villarreal,下场客场 Deportivo。
+    data["next_race"] = {"raceName": "Qatar Grand Prix", "round": "24",
+                         "date": "2026-11-29", "time": "13:00:00Z",
+                         "Circuit": {"circuitId": "losail",
+                                     "circuitName": "Losail International Circuit",
+                                     "Location": {"locality": "Al Daayen",
+                                                  "country": "Qatar"}}}
+    data["last_race"] = {"raceName": "Las Vegas Grand Prix", "round": "23",
+                         "date": "2026-11-22", "time": "05:00:00Z",
+                         "Circuit": {"circuitId": "las_vegas",
+                                     "circuitName": "Las Vegas Strip Circuit",
+                                     "Location": {"locality": "Las Vegas",
+                                                  "country": "United States"}}}
+    data["last_results"] = [("1", "Max Verstappen", "1:39:56.180"),
+                            ("2", "Lando Norris", "+15.080"),
+                            ("3", "Oscar Piastri", "+18.362"),
+                            ("4", "Charles Leclerc", "+22.054"),
+                            ("5", "George Russell", "Power Unit")]
+    data["barca"] = {"opponent": "Deportivo", "venue": "@",
+                     "when": "Nov 29 23:15", "next_date": "2026-11-29",
+                     "rank": "1st", "points": 36,
+                     "last_opponent": "Villarreal", "last_venue": "vs",
+                     "last_score": "3-2", "last_result": "W",
+                     "last_when": "Nov 22 21:00"}
     data["template"] = template
     data["now_bj"] = now_bj
     data["upd"] = "%02d:%02d" % (now_bj.tm_hour, now_bj.tm_min)
