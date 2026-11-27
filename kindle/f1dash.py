@@ -774,6 +774,20 @@ def _espn_barca_entry(standings):
     return walk(standings)
 
 
+def _espn_score(v):
+    """ESPN 比分可能是字符串 '3',也可能是 {'displayValue': '3',
+    'value': 3.0, 'winner': True, ...} 的对象(完整日程接口);统一取显示值。"""
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        dv = v.get("displayValue")
+        if dv is not None:
+            return str(dv)
+        val = v.get("value")
+        return str(int(val)) if val is not None else None
+    return str(v)
+
+
 def get_barca():
     """巴萨下一场 LaLiga 比赛(北京时间)+ 上一场比分 + 当前榜位积分;ESPN 公开接口。
 
@@ -831,11 +845,15 @@ def get_barca():
                 out["last_opponent"], out["last_venue"] = opponent, venue
                 out["last_when"] = time.strftime(
                     "%b %d %H:%M", time.gmtime(best_ts + 8 * 3600))
-                if mine is not None and theirs is not None:
-                    out["last_score"] = "%s-%s" % (mine, theirs)
-                    out["last_result"] = ("W" if int(mine) > int(theirs)
-                                          else "L" if int(mine) < int(theirs)
-                                          else "D")
+                ms, ts_ = _espn_score(mine), _espn_score(theirs)
+                if ms is not None and ts_ is not None:
+                    out["last_score"] = "%s-%s" % (ms, ts_)
+                    try:
+                        f1_, f2_ = float(ms), float(ts_)
+                        out["last_result"] = ("W" if f1_ > f2_
+                                              else "L" if f1_ < f2_ else "D")
+                    except Exception:
+                        out["last_result"] = None
     except Exception:
         pass  # 上一场取不到不影响下一场与榜位
     stand = fetch_json("https://site.api.espn.com/apis/v2/sports/soccer/%s/standings?season=%d"
